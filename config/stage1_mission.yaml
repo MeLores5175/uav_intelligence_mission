@@ -3,9 +3,9 @@
 # 1. 起飞点为原点 (0, 0)，单位 m；
 # 2. +x 与原比赛图 x 方向相同；
 # 3. +y 与原比赛图 y 方向相反；
-# 4. control_mode = position：普通航段，纯位置控制，速度主要由 PX4 位置控制参数决定；
+# 4. control_mode = position：普通航段，但 FSM 内部会转成位置 + 速度融合控制，按距离提前减速；
 # 5. control_mode = fusion：精细停靠点，位置 + 速度融合控制，会停稳后执行 action；
-# 6. control_mode = fusion_route：复杂通过点，位置 + 速度融合控制，但不强制长时间停稳；
+# 6. control_mode = fusion_route：复杂通过点，位置 + 速度融合控制，速度受限但默认不强制刹停；
 # 7. 正式比赛前请按现场实测微调所有 x/y/z，尤其是圆环 x 和降落点映射。
 
 mission:
@@ -41,14 +41,27 @@ mission:
     yaw_eps_deg: 5.0
     yaw_break_eps_deg: 12.0
 
-    # 普通 route 点用 position 控制，不需要特别小的到点误差。
-    route_pos_eps: 0.22
-    route_finish_vel: 0.20
-    route_finish_acc: 0.60
+    # 普通 route 点也会走位置 + 速度融合控制。
+    # route_pos_eps 是进入目标点范围的判据；到点后先刹停，再切下一个 position 航点。
+    route_pos_eps: 0.20
+    route_finish_vel: 0.15
+    route_finish_acc: 0.45
+
+    # 距离减速参数：小于 slow_radius 后，速度按距离线性下降。
+    # 这些参数是第一版保守值，先解决冲太快和刹不住，再逐步加速。
+    route_slow_radius: 1.00
+    obs_slow_radius: 0.80
+    scan_slow_radius: 0.60
+    ring_slow_radius: 0.80
+    land_slow_radius: 1.20
+    route_min_speed: 0.12
+    scan_min_speed: 0.06
+    ring_min_speed: 0.08
 
     # scan/drop/ring 精细点用融合控制，要求更稳。
+    # scan_kp 保留为备用参数；当前速度主要由 speed、acc、slow_radius 控制。
     scan_pos_eps: 0.08
-    scan_kp: 0.75
+    scan_kp: 0.65
     scan_stable_vel: 0.08
     scan_stable_acc: 0.25
     scan_stable_time: 0.70
@@ -71,8 +84,8 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.35
+      speed: 0.32
+      acc: 0.30
       hold_time: 0.50
 
     # 02 顺时针绕障：障碍物中心 (4.3, 0)，半径约 0.9 m
@@ -84,8 +97,8 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.85
-      acc: 0.60
+      speed: 0.55
+      acc: 0.40
 
     - name: OBS_DOWN
       kind: route
@@ -95,8 +108,8 @@ mission:
       y: 0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.75
-      acc: 0.55
+      speed: 0.40
+      acc: 0.32
 
     - name: OBS_LEFT
       kind: route
@@ -106,8 +119,8 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.75
-      acc: 0.55
+      speed: 0.40
+      acc: 0.32
 
     - name: OBS_UP
       kind: route
@@ -117,8 +130,8 @@ mission:
       y: -0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.75
-      acc: 0.55
+      speed: 0.40
+      acc: 0.32
 
     - name: OBS_EXIT
       kind: route
@@ -128,8 +141,8 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.85
-      acc: 0.60
+      speed: 0.55
+      acc: 0.40
 
     # 03 图片靶顺序：图片靶2 -> 图片靶1 -> 图片靶3 -> 图片靶4
     # 每个靶：先高处到正上方，再垂直下降投放判断，再原地爬升，避免低空横移。
@@ -141,8 +154,8 @@ mission:
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.40
-      acc: 0.35
+      speed: 0.35
+      acc: 0.28
       hold_time: 0.15
 
     - name: IMG2_DROP
@@ -153,8 +166,8 @@ mission:
       y: -1.60
       z: 0.75
       yaw_deg: 0.0
-      speed: 0.28
-      acc: 0.25
+      speed: 0.22
+      acc: 0.18
       hold_time: 0.35
 
     - name: IMG2_UP
@@ -165,8 +178,8 @@ mission:
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.30
+      speed: 0.28
+      acc: 0.24
       hold_time: 0.10
 
     - name: IMG1_OVER
@@ -177,8 +190,8 @@ mission:
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.45
-      acc: 0.35
+      speed: 0.35
+      acc: 0.28
       hold_time: 0.15
 
     - name: IMG1_DROP
@@ -189,8 +202,8 @@ mission:
       y: -1.60
       z: 0.75
       yaw_deg: 0.0
-      speed: 0.28
-      acc: 0.25
+      speed: 0.22
+      acc: 0.18
       hold_time: 0.35
 
     - name: IMG1_UP
@@ -201,8 +214,8 @@ mission:
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.30
+      speed: 0.28
+      acc: 0.24
       hold_time: 0.10
 
     - name: IMG3_OVER
@@ -213,8 +226,8 @@ mission:
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.55
-      acc: 0.40
+      speed: 0.35
+      acc: 0.28
       hold_time: 0.15
 
     - name: IMG3_DROP
@@ -225,8 +238,8 @@ mission:
       y: 1.60
       z: 0.75
       yaw_deg: 0.0
-      speed: 0.28
-      acc: 0.25
+      speed: 0.22
+      acc: 0.18
       hold_time: 0.35
 
     - name: IMG3_UP
@@ -237,8 +250,8 @@ mission:
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.30
+      speed: 0.28
+      acc: 0.24
       hold_time: 0.10
 
     - name: IMG4_OVER
@@ -249,8 +262,8 @@ mission:
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.45
-      acc: 0.35
+      speed: 0.35
+      acc: 0.28
       hold_time: 0.15
 
     - name: IMG4_DROP
@@ -261,8 +274,8 @@ mission:
       y: 1.60
       z: 0.75
       yaw_deg: 0.0
-      speed: 0.28
-      acc: 0.25
+      speed: 0.22
+      acc: 0.18
       hold_time: 0.35
 
     - name: IMG4_UP
@@ -273,8 +286,8 @@ mission:
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.30
+      speed: 0.28
+      acc: 0.24
       hold_time: 0.10
 
     # 04 特殊靶：中心 (6.0, 1.0)
@@ -286,8 +299,8 @@ mission:
       y: 1.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.45
-      acc: 0.35
+      speed: 0.35
+      acc: 0.28
       hold_time: 0.25
 
     - name: SPECIAL_DROP
@@ -298,8 +311,8 @@ mission:
       y: 1.00
       z: 0.75
       yaw_deg: 0.0
-      speed: 0.25
-      acc: 0.22
+      speed: 0.22
+      acc: 0.18
       hold_time: 0.35
 
     - name: SPECIAL_UP
@@ -310,8 +323,8 @@ mission:
       y: 1.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.30
+      speed: 0.28
+      acc: 0.24
       hold_time: 0.10
 
     # 05 圆环：规则范围 x = 4.8 ~ 7.2, y = -1.6
@@ -324,8 +337,8 @@ mission:
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.35
-      acc: 0.30
+      speed: 0.30
+      acc: 0.25
 
     - name: RING_PRE
       kind: route
@@ -335,8 +348,8 @@ mission:
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.30
-      acc: 0.25
+      speed: 0.25
+      acc: 0.20
 
     - name: RING_CENTER
       kind: route
@@ -346,8 +359,8 @@ mission:
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.28
-      acc: 0.22
+      speed: 0.23
+      acc: 0.18
 
     - name: RING_POST
       kind: route
@@ -357,8 +370,8 @@ mission:
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.30
-      acc: 0.25
+      speed: 0.25
+      acc: 0.20
 
     # 06 回降落区：先走上侧安全通道，再在 x=1.0 处切到目标降落点 y，避免斜穿障碍物附近。
     - name: LAND_TOP_CORRIDOR
@@ -369,8 +382,8 @@ mission:
       y: -2.20
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.85
-      acc: 0.60
+      speed: 0.50
+      acc: 0.38
 
     - name: LAND_RIGHT_CORRIDOR
       kind: route
@@ -380,8 +393,8 @@ mission:
       y: -2.20
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.95
-      acc: 0.65
+      speed: 0.60
+      acc: 0.42
 
     - name: LAND_APPROACH_DYNAMIC
       kind: route
@@ -392,8 +405,8 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.75
-      acc: 0.50
+      speed: 0.45
+      acc: 0.35
 
     - name: LAND_FINAL_DYNAMIC
       kind: scan
@@ -404,6 +417,6 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.30
-      acc: 0.25
+      speed: 0.25
+      acc: 0.20
       hold_time: 1.00

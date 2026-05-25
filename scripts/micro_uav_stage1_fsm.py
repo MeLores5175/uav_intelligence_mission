@@ -6,11 +6,12 @@
 功能：
 1. 从 YAML 读取任务航点；
 2. 按 FSM 执行起飞、二维码点、绕障点、图片靶点、特殊靶点、圆环前等待点；
-3. route 点：位置控制快速通过，适合精度要求不高的普通航段；
-4. scan/drop/ring 点：位置 + 速度融合控制，适合二维码、图片靶、特殊靶、穿环等复杂动作；
-5. 每个航点先原地转向，再平移，禁止边平移边旋转；
-6. 增加 /uav/start、/uav/stop、/uav/land、/uav/disarm、/uav/reset 安全控制话题；
-7. /uav/stop 定义为“急停降落”：立即取消任务，切 AUTO.LAND，落地后自动 disarm，之后必须 reset 才能再次 start。
+3. route/move 点：远距离只发速度 setpoint，接近目标后切位置锁点，避免最终位置强拉导致冲过头；
+4. scan/drop 点：先用速度控制慢速靠近，进入捕获半径后位置锁点，停稳后再扫描/投放；
+5. 取消扫描阶段的搜索移动：识别/投放 ACTION 阶段只悬停，不主动横移或转向搜索；
+6. 静态识别 ACTION 阶段持续检查位置、速度、加速度，只有停稳时才累计有效识别时间；
+7. 增加 /uav/start、/uav/stop、/uav/land、/uav/disarm、/uav/reset 安全控制话题；
+8. /uav/stop 定义为“急停降落”：立即取消任务，切 AUTO.LAND，落地后自动 disarm，之后必须 reset 才能再次 start。
 """
 
 import os
@@ -40,8 +41,8 @@ class Waypoint:
     action: 到达并停稳后执行的动作。
     x, y, z: 相对起飞点坐标，单位 m。
     yaw_deg: 目标航向角，单位 deg。
-    speed: 当前航点最大速度，单位 m/s，主要用于融合控制的速度前馈限幅。
-    acc: 当前航点最大加速度，单位 m/s^2，用于限制融合控制速度变化。
+    speed: 当前航点移动阶段的期望速度，单位 m/s；本版在 MOVE 阶段作为纯速度 setpoint 的上限使用。
+    acc: 当前航点最大加速度，单位 m/s^2，用于限制速度指令变化，避免突然加减速。
     hold_time: scan 点停稳后的保持时间，单位 s。
     control_mode: 控制模式。auto 根据 kind 自动选择；position 为纯位置控制；fusion 为位置速度融合并停稳；fusion_route 为位置速度融合快速通过。
     dynamic_land: 是否使用二维码中的 left/right 动态替换该航点 y 坐标。
@@ -169,6 +170,31 @@ class MicroUAVStage1FSM:
         self.route_finish_vel = float(self.control_cfg.get("route_finish_vel", 0.18))
         self.route_finish_acc = float(self.control_cfg.get("route_finish_acc", 0.50))
 
+        # ---------- 距离减速参数 ----------
+        # 2026-05-23 修改：所有航点都采用“远处正常飞、近处线性降速、到点刹停”的折中方案。
+        self.route_slow_radius = float(self.control_cfg.get("route_slow_radius", 1.00))
+        self.obs_slow_radius = float(self.control_cfg.get("obs_slow_radius", 0.80))
+        self.scan_slow_radius = float(self.control_cfg.get("scan_slow_radius", 0.60))
+        self.ring_slow_radius = float(self.control_cfg.get("ring_slow_radius", 0.80))
+        self.land_slow_radius = float(self.control_cfg.get("land_slow_radius", 1.20))
+
+        self.route_min_speed = float(self.control_cfg.get("route_min_speed", 0.12))
+        self.scan_min_speed = float(self.control_cfg.get("scan_min_speed", 0.06))
+        self.ring_min_speed = float(self.control_cfg.get("ring_min_speed", 0.08))
+
+        # ---------- 速度控制转位置锁点的捕获半径 ----------
+        # 2026-05-25 修改：MOVE 阶段不再发布“最终位置 + 速度前馈”。
+        # 当距离目标点小于 capture_radius 后，切入 BRAKE，用位置锁点 + 0 速度等待真实停稳。
+        self.route_capture_radius = float(
+            self.control_cfg.get("route_capture_radius", max(0.35, self.route_pos_eps * 1.8))
+        )
+        self.scan_capture_radius = float(
+            self.control_cfg.get("scan_capture_radius", max(0.25, float(self.control_cfg.get("scan_pos_eps", 0.08)) * 3.0))
+        )
+        self.ring_capture_radius = float(
+            self.control_cfg.get("ring_capture_radius", max(0.18, self.route_pos_eps))
+        )
+
         # ---------- scan 点判断参数 ----------
         self.scan_pos_eps = float(self.control_cfg.get("scan_pos_eps", 0.08))
         self.scan_kp = float(self.control_cfg.get("scan_kp", 0.70))
@@ -229,6 +255,9 @@ class MicroUAVStage1FSM:
         self.phase_start_time = rospy.Time.now()
         self.stable_start_time = None
         self.action_start_time = None
+        # 2026-05-23 修改：静态扫描/投放 ACTION 阶段的连续停稳起点。
+        # 只有无人机位置、速度、加速度都满足阈值时，才从该时间开始累计有效扫描时间。
+        self.action_stable_start_time = None
         self.action_sent = False
 
         # ---------- 安全状态变量 ----------
@@ -439,7 +468,7 @@ class MicroUAVStage1FSM:
             if wp.kind not in ["route", "scan"]:
                 raise RuntimeError("Waypoint %s has invalid kind: %s" % (wp.name, wp.kind))
 
-            # 2026-05-18 修改：默认 route 采用位置控制，scan 采用位置 + 速度融合控制。
+            # 2026-05-18 修改：默认 route 标记为 position；2026-05-23 起 position 也会走速度受限的融合控制。
             if wp.control_mode == "auto":
                 if wp.kind == "route":
                     wp.control_mode = "position"
@@ -694,7 +723,7 @@ class MicroUAVStage1FSM:
     def publish_position_velocity_yaw(self, x, y, z, vx, vy, vz, yaw):
         """
         发布位置 + 速度 + yaw 融合指令。
-        用于 scan/drop 点稳定停靠。
+        本版正常移动阶段不再使用它做限速；主要用于起飞、HOLD、ACTION 等锁点阶段。
         """
         msg = self.make_target_msg()
 
@@ -720,7 +749,7 @@ class MicroUAVStage1FSM:
     def publish_position_yaw(self, x, y, z, yaw):
         """
         发布纯位置 + yaw 指令。
-        用于普通 route 航段：精度要求不高，交给 PX4 位置控制器快速飞到目标附近。
+        保留为备用接口；正常任务中 HOLD/ACTION 更常使用位置 + 0 速度锁点。
         """
         msg = self.make_target_msg()
 
@@ -805,6 +834,7 @@ class MicroUAVStage1FSM:
         self.phase_start_time = rospy.Time.now()
         self.stable_start_time = None
         self.action_start_time = None
+        self.action_stable_start_time = None
         self.action_sent = False
         self.cmd_vel = [0.0, 0.0, 0.0]
 
@@ -849,6 +879,7 @@ class MicroUAVStage1FSM:
         self.phase_start_time = rospy.Time.now()
         self.stable_start_time = None
         self.action_start_time = None
+        self.action_stable_start_time = None
         self.action_sent = False
 
     def cancel_task_outputs(self):
@@ -857,6 +888,7 @@ class MicroUAVStage1FSM:
         self.scan_target_pub.publish(String(data="none"))
         self.action_sent = False
         self.action_start_time = None
+        self.action_stable_start_time = None
 
     def is_yaw_aligned(self, target_yaw):
         """判断 yaw 是否对齐。"""
@@ -1140,6 +1172,122 @@ class MicroUAVStage1FSM:
     # 10. 航点导航控制区
     # =========================
 
+    def get_slow_radius(self, wp):
+        """
+        根据航点名称和控制模式选择减速半径。
+        变量 slow_radius 的作用：当剩余距离小于该半径时，速度开始按距离线性下降。
+        """
+        name = wp.name.upper()
+
+        if name.startswith("RING"):
+            return self.ring_slow_radius
+
+        if name.startswith("OBS"):
+            return self.obs_slow_radius
+
+        if name.startswith("LAND"):
+            return self.land_slow_radius
+
+        if wp.kind == "scan" or name.startswith("IMG") or name.startswith("SPECIAL"):
+            return self.scan_slow_radius
+
+        return self.route_slow_radius
+
+    def get_min_speed(self, wp):
+        """
+        根据航点类型选择接近目标点时的最低靠近速度。
+        注意：一旦进入到点误差范围，会直接给 0 速度，不会继续保持最低速度向前冲。
+        """
+        name = wp.name.upper()
+
+        if name.startswith("RING"):
+            return self.ring_min_speed
+
+        if wp.kind == "scan":
+            return self.scan_min_speed
+
+        return self.route_min_speed
+
+    def calc_smooth_cmd_vel(self, wp, dx, dy, dz, dist, dt, arrive_eps):
+        """
+        计算平滑靠近目标点的速度指令。
+        核心逻辑：
+        1. 距离大于 slow_radius 时，按 wp.speed 正常飞；
+        2. 距离小于 slow_radius 时，速度按 dist / slow_radius 线性下降；
+        3. 距离进入 arrive_eps 后，目标速度直接变为 0，交给位置环和刹停阶段稳定；
+        4. 最后用 wp.acc * dt 限制每一帧速度变化，避免指令突变。
+        """
+        if dist < 1e-6 or dist <= arrive_eps:
+            desired_vel = [0.0, 0.0, 0.0]
+        else:
+            slow_radius = max(self.get_slow_radius(wp), arrive_eps + 0.05)
+            max_speed = max(0.05, wp.speed)
+            min_speed = clamp(self.get_min_speed(wp), 0.02, max_speed)
+
+            if dist < slow_radius:
+                target_speed = max_speed * dist / slow_radius
+                target_speed = clamp(target_speed, min_speed, max_speed)
+            else:
+                target_speed = max_speed
+
+            ux = dx / dist
+            uy = dy / dist
+            uz = dz / dist
+            desired_vel = [ux * target_speed, uy * target_speed, uz * target_speed]
+
+        max_delta = max(0.001, wp.acc * dt)
+        self.cmd_vel = limit_vector_change(self.cmd_vel, desired_vel, max_delta)
+        return self.cmd_vel
+
+    def get_arrive_eps(self, wp):
+        """
+        根据航点类型选择真正的到点误差阈值。
+        scan/drop 点需要更准，因此使用 scan_pos_eps；普通 route 点使用 route_pos_eps。
+        """
+        if wp.kind == "scan" or wp.control_mode == "fusion":
+            return self.scan_pos_eps
+
+        return self.route_pos_eps
+
+    def get_capture_radius(self, wp):
+        """
+        速度控制切换到位置锁点的捕获半径。
+        作用：远处只发速度，避免 PX4 位置环被最终目标强拉；近处再交给位置控制锁点。
+        """
+        name = wp.name.upper()
+
+        if wp.control_mode == "fusion_route" or name.startswith("RING"):
+            return max(self.ring_capture_radius, self.route_pos_eps)
+
+        if wp.kind == "scan" or wp.control_mode == "fusion":
+            return max(self.scan_capture_radius, self.scan_pos_eps)
+
+        return max(self.route_capture_radius, self.route_pos_eps)
+
+    def publish_velocity_approach(self, wp, dx, dy, dz, dist, dt, arrive_eps):
+        """
+        MOVE 阶段的纯速度靠近控制。
+        关键点：这里只发布 velocity + yaw，不发布最终 position，避免 position + velocity 前馈导致冲过头。
+        """
+        self.calc_smooth_cmd_vel(wp, dx, dy, dz, dist, dt, arrive_eps)
+        self.publish_velocity_yaw(
+            self.cmd_vel[0],
+            self.cmd_vel[1],
+            self.cmd_vel[2],
+            self.locked_yaw
+        )
+        return norm3(self.cmd_vel[0], self.cmd_vel[1], self.cmd_vel[2])
+
+    def route_need_brake(self, wp):
+        """
+        判断普通 route 到点后是否需要先刹停再切下一个点。
+        position 航点通常是绕障/回航转折点，默认刹停；fusion_route 用于圆环等连续通过点，默认不断停。
+        """
+        if wp.action != "none":
+            return True
+
+        return wp.control_mode == "position"
+
     def process_current_waypoint(self, dt):
         """处理当前航点，包括 yaw 对齐、移动、刹停、停稳、动作。"""
         if self.wp_index >= len(self.waypoints):
@@ -1156,12 +1304,9 @@ class MicroUAVStage1FSM:
         dist = norm3(dx, dy, dz)
 
         if self.nav_phase == "INIT":
-            # 普通位置控制 / 融合快速通过航段，默认先把机头转向运动方向；
-            # 扫码、投放、穿环等待等精细点，使用 YAML 指定的 yaw。
-            if wp.control_mode in ["position", "fusion_route"] and dist > 0.10:
-                self.locked_yaw = math.atan2(dy, dx)
-            else:
-                self.locked_yaw = target_yaw
+            # 2026-05-23 修改：取消“默认朝向目标点/运动方向”的 yaw 策略。
+            # 所有航点统一使用 YAML 中的 yaw_deg，避免普通点、绕障点、圆环点频繁转头。
+            self.locked_yaw = target_yaw
 
             self.enter_nav_phase("YAW_ALIGN")
             return
@@ -1198,7 +1343,7 @@ class MicroUAVStage1FSM:
                 return
 
             if wp.control_mode == "position":
-                self.process_route_move(wp, tx, ty, tz, dist)
+                self.process_route_move(wp, tx, ty, tz, dist, dx, dy, dz, dt)
                 return
 
             if wp.control_mode == "fusion_route":
@@ -1210,22 +1355,45 @@ class MicroUAVStage1FSM:
                 return
 
         if self.nav_phase == "BRAKE":
-            self.publish_velocity_yaw(0.0, 0.0, 0.0, self.locked_yaw)
-
-            stable_ready = self.is_speed_acc_stable(
-                self.route_finish_vel,
-                self.route_finish_acc
+            # 2026-05-25 修改：BRAKE 不再只发零速度。
+            # 只发零速度可能会让飞机停在目标点后面；这里改成锁定目标位置 + 0 速度。
+            self.publish_position_velocity_yaw(
+                tx,
+                ty,
+                tz,
+                0.0,
+                0.0,
+                0.0,
+                self.locked_yaw
             )
 
+            arrive_eps = self.get_arrive_eps(wp)
+
+            if wp.kind == "scan" or wp.control_mode == "fusion":
+                vel_th = self.scan_stable_vel
+                acc_th = self.scan_stable_acc
+            else:
+                vel_th = self.route_finish_vel
+                acc_th = self.route_finish_acc
+
+            pos_ready = dist < arrive_eps
+            stable_ready = pos_ready and self.is_speed_acc_stable(vel_th, acc_th)
+
             if stable_ready:
-                self.next_waypoint()
+                if wp.action == "none":
+                    self.next_waypoint()
+                else:
+                    self.enter_nav_phase("HOLD")
 
             rospy.loginfo_throttle(
                 0.5,
-                "[BRAKE] wp=%s vel=%.2f acc=%.2f",
+                "[POSITION_LOCK_BRAKE] wp=%s dist=%.2f eps=%.2f vel=%.2f acc=%.2f pos_ok=%s",
                 wp.name,
+                dist,
+                arrive_eps,
                 self.current_speed,
-                self.current_acc_norm
+                self.current_acc_norm,
+                str(pos_ready)
             )
 
             return
@@ -1252,95 +1420,138 @@ class MicroUAVStage1FSM:
             self.process_action(wp, tx, ty, tz)
             return
 
-    def process_route_move(self, wp, tx, ty, tz, dist):
-        """route 点纯位置控制移动：到达目标附近后直接切下一个点。"""
-        self.publish_position_yaw(tx, ty, tz, self.locked_yaw)
+    def process_route_move(self, wp, tx, ty, tz, dist, dx, dy, dz, dt):
+        """
+        普通 route 点移动。
+        2026-05-25 修改：MOVE 阶段改为纯速度控制；进入捕获半径后切 BRAKE 位置锁点。
+        """
+        arrive_eps = self.get_arrive_eps(wp)
+        capture_radius = self.get_capture_radius(wp)
 
-        if dist < self.route_pos_eps:
-            if wp.action == "none":
-                self.next_waypoint()
-            else:
-                self.enter_nav_phase("HOLD")
-
+        if dist <= capture_radius:
+            self.enter_nav_phase("BRAKE")
             return
+
+        cmd_speed = self.publish_velocity_approach(
+            wp,
+            dx,
+            dy,
+            dz,
+            dist,
+            dt,
+            arrive_eps
+        )
 
         rospy.loginfo_throttle(
             0.5,
-            "[ROUTE_POSITION] wp=%s dist=%.2f real_v=%.2f acc=%.2f",
+            "[ROUTE_VEL_APPROACH] wp=%s dist=%.2f capture=%.2f cmd_v=%.2f real_v=%.2f acc=%.2f slow_r=%.2f",
             wp.name,
             dist,
+            capture_radius,
+            cmd_speed,
             self.current_speed,
-            self.current_acc_norm
+            self.current_acc_norm,
+            self.get_slow_radius(wp)
         )
 
     def process_fusion_route_move(self, wp, tx, ty, tz, pos_err, dx, dy, dz, dt):
-        """复杂通过点的位置 + 速度融合控制，例如穿环前后直线通过。"""
-        vx = self.scan_kp * dx
-        vy = self.scan_kp * dy
-        vz = self.scan_kp * dz
+        """
+        复杂通过点控制，例如圆环前后直线通过。
+        2026-05-25 修改：默认用纯速度通过，不再发送最终位置 + 速度前馈。
+        """
+        arrive_eps = self.get_arrive_eps(wp)
+        capture_radius = self.get_capture_radius(wp)
 
-        vx, vy, vz = limit_vector_norm(vx, vy, vz, wp.speed)
-
-        max_delta = wp.acc * dt
-
-        self.cmd_vel = limit_vector_change(
-            self.cmd_vel,
-            [vx, vy, vz],
-            max_delta
-        )
-
-        self.publish_position_velocity_yaw(
-            tx,
-            ty,
-            tz,
-            self.cmd_vel[0],
-            self.cmd_vel[1],
-            self.cmd_vel[2],
-            self.locked_yaw
-        )
-
-        if pos_err < self.route_pos_eps:
-            if wp.action == "none":
+        if pos_err <= arrive_eps:
+            if self.route_need_brake(wp):
+                self.enter_nav_phase("BRAKE")
+            elif wp.action == "none":
                 self.next_waypoint()
             else:
-                self.enter_nav_phase("HOLD")
-
+                self.enter_nav_phase("BRAKE")
             return
+
+        # fusion_route 用于圆环这类连续通过点：不提前切位置锁点，只用速度控制靠近/通过。
+        # 如果未来某个 fusion_route 需要停稳，只要给它配置 action 或改成 fusion 即可。
+        cmd_speed = self.publish_velocity_approach(
+            wp,
+            dx,
+            dy,
+            dz,
+            pos_err,
+            dt,
+            arrive_eps
+        )
 
         rospy.loginfo_throttle(
             0.5,
-            "[FUSION_ROUTE] wp=%s err=%.2f cmd_v=%.2f real_v=%.2f",
+            "[FUSION_ROUTE_VEL] wp=%s err=%.2f eps=%.2f cmd_v=%.2f real_v=%.2f slow_r=%.2f",
             wp.name,
             pos_err,
-            norm3(self.cmd_vel[0], self.cmd_vel[1], self.cmd_vel[2]),
-            self.current_speed
+            arrive_eps,
+            cmd_speed,
+            self.current_speed,
+            self.get_slow_radius(wp)
         )
 
     def process_scan_move(self, wp, tx, ty, tz, pos_err, dx, dy, dz, dt):
-        """scan 点位置 + 速度融合控制，并检查停稳条件。"""
-        vx = self.scan_kp * dx
-        vy = self.scan_kp * dy
-        vz = self.scan_kp * dz
+        """
+        scan/drop 点移动。
+        2026-05-25 修改：远处只发速度；接近扫描点后切 BRAKE，由位置锁点等待真实停稳。
+        """
+        arrive_eps = self.get_arrive_eps(wp)
+        capture_radius = self.get_capture_radius(wp)
 
-        vx, vy, vz = limit_vector_norm(vx, vy, vz, wp.speed)
+        if pos_err <= capture_radius:
+            self.enter_nav_phase("BRAKE")
+            return
 
-        max_delta = wp.acc * dt
-
-        self.cmd_vel = limit_vector_change(
-            self.cmd_vel,
-            [vx, vy, vz],
-            max_delta
+        cmd_speed = self.publish_velocity_approach(
+            wp,
+            dx,
+            dy,
+            dz,
+            pos_err,
+            dt,
+            arrive_eps
         )
 
-        self.publish_position_velocity_yaw(
-            tx,
-            ty,
-            tz,
-            self.cmd_vel[0],
-            self.cmd_vel[1],
-            self.cmd_vel[2],
-            self.locked_yaw
+        rospy.loginfo_throttle(
+            0.5,
+            "[SCAN_VEL_APPROACH] wp=%s err=%.2f capture=%.2f cmd_v=%.2f real_v=%.2f acc=%.2f slow_r=%.2f",
+            wp.name,
+            pos_err,
+            capture_radius,
+            cmd_speed,
+            self.current_speed,
+            self.current_acc_norm,
+            self.get_slow_radius(wp)
         )
+
+    # =========================
+    # 11. 动作执行区
+    # =========================
+
+    def action_requires_static_hover(self, wp):
+        """
+        判断当前 ACTION 是否必须静态悬停。
+        2026-05-23 修改：取消扫描搜索移动后，二维码、图片靶、特殊靶识别/投放都按静态动作处理。
+        """
+        return wp.action in [
+            "qr_scan",
+            "image_drop_1",
+            "image_drop_2",
+            "image_scan_maybe_drop",
+            "special_drop",
+        ]
+
+    def check_action_static_stable(self, tx, ty, tz):
+        """
+        ACTION 阶段的持续停稳检查。
+        返回 stable 和当前位置误差，供静态扫描/投放动作使用。
+        """
+        cx, cy, cz = self.current_xyz()
+        pos_err = norm3(tx - cx, ty - cy, tz - cz)
 
         stable = (
             pos_err < self.scan_pos_eps and
@@ -1348,37 +1559,15 @@ class MicroUAVStage1FSM:
             self.current_acc_norm < self.scan_stable_acc
         )
 
-        if stable:
-            if self.stable_start_time is None:
-                self.stable_start_time = rospy.Time.now()
-
-            stable_time = (rospy.Time.now() - self.stable_start_time).to_sec()
-
-            if stable_time > self.scan_stable_time:
-                self.enter_nav_phase("HOLD")
-        else:
-            self.stable_start_time = None
-
-        rospy.loginfo_throttle(
-            0.5,
-            "[SCAN_MOVE] wp=%s err=%.2f cmd_v=%.2f real_v=%.2f acc=%.2f stable=%s",
-            wp.name,
-            pos_err,
-            norm3(self.cmd_vel[0], self.cmd_vel[1], self.cmd_vel[2]),
-            self.current_speed,
-            self.current_acc_norm,
-            str(stable)
-        )
-
-    # =========================
-    # 11. 动作执行区
-    # =========================
+        return stable, pos_err
 
     def process_action(self, wp, tx, ty, tz):
         """
         到达 scan 点后的动作执行。
-        当前版本只提供接口，不强行绑定具体视觉算法和投放机构。
+        2026-05-23 修改：取消扫描搜索移动，ACTION 阶段只发布固定位置 + 零速度指令。
+        对二维码、图片靶、特殊靶等静态动作，只有持续停稳时才累计有效动作时间。
         """
+        # 识别/投放阶段不做主动搜索移动：位置锁定在当前航点，速度指令固定为 0。
         self.publish_position_velocity_yaw(
             tx,
             ty,
@@ -1389,14 +1578,47 @@ class MicroUAVStage1FSM:
             self.locked_yaw
         )
 
+        now = rospy.Time.now()
+
         if self.action_start_time is None:
-            self.action_start_time = rospy.Time.now()
+            self.action_start_time = now
+            self.action_stable_start_time = None
             self.action_sent = False
 
             if wp.action == "image_scan_maybe_drop":
                 self.current_image_class = ""
 
-        action_elapsed = (rospy.Time.now() - self.action_start_time).to_sec()
+        if self.action_requires_static_hover(wp):
+            stable, pos_err = self.check_action_static_stable(tx, ty, tz)
+
+            if stable:
+                if self.action_stable_start_time is None:
+                    self.action_stable_start_time = now
+
+                # 静态识别/投放动作只累计“连续停稳时间”，不再用普通墙钟时间硬跑。
+                action_elapsed = (now - self.action_stable_start_time).to_sec()
+            else:
+                self.action_stable_start_time = None
+
+                # 如果还没有发出投放命令，不稳定时先不开启识别有效计时，也不进入投放逻辑。
+                if not self.action_sent:
+                    self.scan_enable_pub.publish(Bool(data=False))
+                    self.scan_target_pub.publish(String(data="none"))
+
+                    rospy.loginfo_throttle(
+                        0.5,
+                        "[ACTION_WAIT_STABLE] wp=%s err=%.2f vel=%.2f acc=%.2f",
+                        wp.name,
+                        pos_err,
+                        self.current_speed,
+                        self.current_acc_norm
+                    )
+                    return
+
+                # 投放命令已经发出后，不再重置流程，只继续保持悬停等待动作结束。
+                action_elapsed = (now - self.action_start_time).to_sec()
+        else:
+            action_elapsed = (now - self.action_start_time).to_sec()
 
         if wp.action == "none":
             self.next_waypoint()
