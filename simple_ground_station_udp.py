@@ -8,7 +8,7 @@
 3. 等待无人机端 UDP 接收节点返回 ACK 或 STATUS。
 
 无人机端默认：
-    IP   = 192.168.151.102
+    IP   = 127.0.0.1
     PORT = 8888
 """
 
@@ -16,7 +16,7 @@ import socket
 import time
 
 
-UAV_IP = "192.168.151.102"
+UAV_IP = "10.82.0.168"
 UAV_PORT = 8888
 
 RECV_TIMEOUT = 1.0

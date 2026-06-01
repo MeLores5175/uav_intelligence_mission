@@ -15,11 +15,18 @@ mission:
   takeoff:
     z: 1.35
     yaw_deg: 0.0
-    stable_time: 0.70
+    # 起飞判稳单独配置：不沿用 scan/drop 的 8cm 严格判据。
+    stable_time: 0.40
+    pos_eps: 0.15
+    stable_vel: 0.18
+    stable_acc: 0.80
+    max_wait: 5.0
+    min_height: 1.20
 
   # 正式比赛建议 true；如果只想单独调航线，可临时改 false。
   wait_real_qr: true
   wait_real_image: true
+  wait_real_ring: true
 
   # 降落点映射
   # 当前按之前讨论：left -> 下方 H 点 (0, 1.6)，right -> 上方 H 点 (0, -1.6)。
@@ -44,8 +51,17 @@ mission:
     # 普通 route 点也会走位置 + 速度融合控制。
     # route_pos_eps 是进入目标点范围的判据；到点后先刹停，再切下一个 position 航点。
     route_pos_eps: 0.20
-    route_finish_vel: 0.15
+    route_finish_vel: 0.20
     route_finish_acc: 0.45
+
+    # 判稳防卡死：普通路线点默认不用加速度硬卡，只要求到点 + 低速。
+    acc_lpf_alpha: 0.25
+    yaw_align_use_acc_gate: false
+    yaw_align_soft_wait: 0.80
+    yaw_align_soft_vel: 0.25
+    brake_timeout: 1.20
+    brake_soft_vel: 0.25
+    action_use_acc_gate: false
 
     # 距离减速参数：小于 slow_radius 后，速度按距离线性下降。
     # 这些参数是第一版保守值，先解决冲太快和刹不住，再逐步加速。
@@ -60,11 +76,11 @@ mission:
 
     # scan/drop/ring 精细点用融合控制，要求更稳。
     # scan_kp 保留为备用参数；当前速度主要由 speed、acc、slow_radius 控制。
-    scan_pos_eps: 0.08
+    scan_pos_eps: 0.10
     scan_kp: 0.65
-    scan_stable_vel: 0.08
-    scan_stable_acc: 0.25
-    scan_stable_time: 0.70
+    scan_stable_vel: 0.12
+    scan_stable_acc: 0.80
+    scan_stable_time: 0.40
 
   # 动作耗时参数
   action:
@@ -72,6 +88,40 @@ mission:
     image_scan_time: 1.2
     drop_time: 1.0
     hold_after_action: 0.25
+    # ACTION 软判稳：防止识别/投放动作被轻微抖动无限卡住。
+    action_soft_timeout: 1.50
+    action_soft_pos_eps: 0.18
+    action_soft_vel: 0.20
+
+    # 图片靶 / 特殊靶视觉闭环对准参数
+    # 视觉节点负责像素 -> 米制偏差；FSM 只使用 offset_x_m / offset_y_m 做小范围移动。
+    vision_result_timeout: 0.50
+    image_align_timeout: 4.0
+    special_align_timeout: 4.0
+    align_xy_eps: 0.05
+    align_step_max: 0.15
+    align_gain: 0.80
+    align_min_confidence: 0.75
+    align_min_stable_count: 3
+
+    # 圆环视觉搜索 / 穿越参数
+    # 视觉节点负责输出当前机体系下的 forward_m、offset_y_m、offset_z_m。
+    # FSM 在 RING_SEARCH_START 锁定圆环中心，动态生成 RING_PRE / RING_CENTER / RING_POST；
+    # 在 RING_PRE 再做一次左右/高度对准，然后连续穿过圆环。
+    ring_search_timeout: 5.0
+    ring_timeout_policy: hold   # hold：视觉失败原地等；fixed：失败后用 YAML 固定点继续；skip：失败后直接继续下个点
+    ring_pre_distance: 0.65
+    ring_post_distance: 0.80
+    ring_align_timeout: 4.0
+    ring_yz_eps: 0.07
+    ring_align_step_max: 0.12
+    ring_align_gain: 0.75
+    ring_min_confidence: 0.70
+    ring_min_stable_count: 3
+    ring_forward_min: 0.30
+    ring_forward_max: 3.50
+    ring_min_z: 1.35
+    ring_max_z: 1.85
 
   # 固定任务点
   waypoints:
@@ -327,29 +377,32 @@ mission:
       acc: 0.24
       hold_time: 0.10
 
-    # 05 圆环：规则范围 x = 4.8 ~ 7.2, y = -1.6
-    # 这里先使用默认中心 x = 6.0；后续接入视觉后可用识别结果替换这些点。
+    # 05 圆环：默认点只作为视觉失败或单独调航线时的 fallback。
+    # 正常流程：RING_SEARCH_START 停稳识别圆环 -> 动态生成 RING_PRE / RING_CENTER / RING_POST；
+    # RING_PRE 再做一次左右/高度对准 -> RING_CENTER 和 RING_POST 连续通过。
     - name: RING_SEARCH_START
-      kind: route
-      control_mode: fusion_route
-      action: none
+      kind: scan
+      control_mode: fusion
+      action: ring_search
       x: 4.80
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.30
-      acc: 0.25
+      speed: 0.28
+      acc: 0.22
+      hold_time: 0.30
 
     - name: RING_PRE
-      kind: route
-      control_mode: fusion_route
-      action: none
+      kind: scan
+      control_mode: fusion
+      action: ring_pre_align
       x: 5.20
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.25
-      acc: 0.20
+      speed: 0.24
+      acc: 0.18
+      hold_time: 0.20
 
     - name: RING_CENTER
       kind: route
@@ -359,8 +412,8 @@ mission:
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.23
-      acc: 0.18
+      speed: 0.26
+      acc: 0.20
 
     - name: RING_POST
       kind: route
@@ -370,8 +423,8 @@ mission:
       y: -1.60
       z: 1.60
       yaw_deg: 0.0
-      speed: 0.25
-      acc: 0.20
+      speed: 0.30
+      acc: 0.22
 
     # 06 回降落区：先走上侧安全通道，再在 x=1.0 处切到目标降落点 y，避免斜穿障碍物附近。
     - name: LAND_TOP_CORRIDOR

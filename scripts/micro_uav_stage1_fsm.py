@@ -8,14 +8,16 @@
 2. 按 FSM 执行起飞、二维码点、绕障点、图片靶点、特殊靶点、圆环前等待点；
 3. route/move 点：远距离只发速度 setpoint，接近目标后切位置锁点，避免最终位置强拉导致冲过头；
 4. scan/drop 点：先用速度控制慢速靠近，进入捕获半径后位置锁点，停稳后再扫描/投放；
-5. 取消扫描阶段的搜索移动：识别/投放 ACTION 阶段只悬停，不主动横移或转向搜索；
-6. 静态识别 ACTION 阶段持续检查位置、速度、加速度，只有停稳时才累计有效识别时间；
-7. 增加 /uav/start、/uav/stop、/uav/land、/uav/disarm、/uav/reset 安全控制话题；
-8. /uav/stop 定义为“急停降落”：立即取消任务，切 AUTO.LAND，落地后自动 disarm，之后必须 reset 才能再次 start。
+5. 二维码扫描仍然静态悬停；图片靶/特殊靶 ACTION 阶段支持视觉米制偏差闭环对准后投放；
+6. 圆环阶段支持 ring_gate 视觉结果：搜索锁定圆环中心、动态生成 RING_PRE/RING_CENTER/RING_POST，并在 RING_PRE 进行左右/高度二次对准；
+7. 静态识别 ACTION 阶段持续检查位置和速度；加速度只作为可选辅助门槛，避免实机噪声卡死；
+8. 增加 /uav/start、/uav/stop、/uav/land、/uav/disarm、/uav/reset 安全控制话题；
+9. /uav/stop 定义为“急停降落”：立即取消任务，切 AUTO.LAND，落地后自动 disarm，之后必须 reset 才能再次 start。
 """
 
 import os
 import math
+import json
 from dataclasses import dataclass
 
 import yaml
@@ -150,6 +152,8 @@ class MicroUAVStage1FSM:
         self.frame_mode = self.mission_cfg["mission"].get("frame", "relative_home")
         self.wait_real_qr = self.mission_cfg["mission"].get("wait_real_qr", False)
         self.wait_real_image = self.mission_cfg["mission"].get("wait_real_image", False)
+        # 圆环视觉可以单独开关；默认跟随 wait_real_image，调航线时可设为 false。
+        self.wait_real_ring = self.mission_cfg["mission"].get("wait_real_ring", self.wait_real_image)
 
         self.control_cfg = self.mission_cfg["mission"].get("control", {})
         self.action_cfg = self.mission_cfg["mission"].get("action", {})
@@ -161,6 +165,17 @@ class MicroUAVStage1FSM:
         # ---------- 控制频率 ----------
         self.rate_hz = float(self.control_cfg.get("rate_hz", 30.0))
 
+        # ---------- 判稳防卡死参数 ----------
+        # 速度差分得到的加速度在实机上很容易被定位/速度噪声放大。
+        # 因此默认只把加速度作为滤波后的辅助信息，不再让所有航点都被 acc 硬卡。
+        self.acc_lpf_alpha = float(self.control_cfg.get("acc_lpf_alpha", 0.25))
+        self.yaw_align_use_acc_gate = bool(self.control_cfg.get("yaw_align_use_acc_gate", False))
+        self.yaw_align_soft_wait = float(self.control_cfg.get("yaw_align_soft_wait", 0.80))
+        self.yaw_align_soft_vel = float(self.control_cfg.get("yaw_align_soft_vel", 0.25))
+        self.brake_timeout = float(self.control_cfg.get("brake_timeout", 1.20))
+        self.brake_soft_vel = float(self.control_cfg.get("brake_soft_vel", 0.25))
+        self.action_use_acc_gate = bool(self.control_cfg.get("action_use_acc_gate", False))
+
         # ---------- yaw 控制参数 ----------
         self.yaw_eps = math.radians(float(self.control_cfg.get("yaw_eps_deg", 5.0)))
         self.yaw_break_eps = math.radians(float(self.control_cfg.get("yaw_break_eps_deg", 12.0)))
@@ -169,6 +184,7 @@ class MicroUAVStage1FSM:
         self.route_pos_eps = float(self.control_cfg.get("route_pos_eps", 0.18))
         self.route_finish_vel = float(self.control_cfg.get("route_finish_vel", 0.18))
         self.route_finish_acc = float(self.control_cfg.get("route_finish_acc", 0.50))
+        self.yaw_align_soft_vel = max(self.yaw_align_soft_vel, self.route_finish_vel)
 
         # ---------- 距离减速参数 ----------
         # 2026-05-23 修改：所有航点都采用“远处正常飞、近处线性降速、到点刹停”的折中方案。
@@ -206,12 +222,51 @@ class MicroUAVStage1FSM:
         self.takeoff_height = float(self.takeoff_cfg.get("z", 1.30))
         self.takeoff_yaw_deg = float(self.takeoff_cfg.get("yaw_deg", 0.0))
         self.takeoff_stable_time = float(self.takeoff_cfg.get("stable_time", 0.80))
+        # 起飞只要求达到安全悬停状态，不能沿用 scan/drop 的 8cm 严格判据。
+        self.takeoff_pos_eps = float(self.takeoff_cfg.get("pos_eps", 0.15))
+        self.takeoff_stable_vel = float(self.takeoff_cfg.get("stable_vel", 0.18))
+        self.takeoff_stable_acc = float(self.takeoff_cfg.get("stable_acc", 0.80))
+        self.takeoff_max_wait = float(self.takeoff_cfg.get("max_wait", 5.0))
+        self.takeoff_min_height = float(self.takeoff_cfg.get("min_height", 1.20))
 
         # ---------- 动作参数 ----------
         self.qr_scan_timeout = float(self.action_cfg.get("qr_scan_timeout", 3.0))
         self.image_scan_time = float(self.action_cfg.get("image_scan_time", 1.5))
         self.drop_time = float(self.action_cfg.get("drop_time", 1.2))
         self.hold_after_action = float(self.action_cfg.get("hold_after_action", 0.3))
+        # ACTION 软判稳只用于防止长期被轻微速度/定位抖动卡住；仍要求位置近、速度低。
+        self.action_soft_timeout = float(self.action_cfg.get("action_soft_timeout", 1.50))
+        self.action_soft_pos_eps = float(self.action_cfg.get("action_soft_pos_eps", 0.18))
+        self.action_soft_vel = float(self.action_cfg.get("action_soft_vel", 0.20))
+
+        # ---------- 图片靶 / 特殊靶视觉闭环对准参数 ----------
+        # 视觉节点负责把像素偏差换算成米制偏差，FSM 只使用 offset_x_m / offset_y_m 做小范围移动。
+        self.vision_result_timeout = float(self.action_cfg.get("vision_result_timeout", 0.50))
+        self.image_align_timeout = float(self.action_cfg.get("image_align_timeout", 4.0))
+        self.special_align_timeout = float(self.action_cfg.get("special_align_timeout", 4.0))
+        self.align_xy_eps = float(self.action_cfg.get("align_xy_eps", 0.05))
+        self.align_step_max = float(self.action_cfg.get("align_step_max", 0.15))
+        self.align_gain = float(self.action_cfg.get("align_gain", 0.80))
+        self.align_min_confidence = float(self.action_cfg.get("align_min_confidence", 0.75))
+        self.align_min_stable_count = int(self.action_cfg.get("align_min_stable_count", 3))
+
+        # ---------- 圆环视觉搜索 / 穿越参数 ----------
+        # ring_gate 视觉节点输出当前机体系下的 forward_m、offset_y_m、offset_z_m。
+        # FSM 根据这些米制偏差动态生成穿环三点，并在 RING_PRE 做二次对准。
+        self.ring_search_timeout = float(self.action_cfg.get("ring_search_timeout", 5.0))
+        self.ring_timeout_policy = str(self.action_cfg.get("ring_timeout_policy", "hold")).lower()
+        self.ring_pre_distance = float(self.action_cfg.get("ring_pre_distance", 0.65))
+        self.ring_post_distance = float(self.action_cfg.get("ring_post_distance", 0.80))
+        self.ring_align_timeout = float(self.action_cfg.get("ring_align_timeout", 4.0))
+        self.ring_yz_eps = float(self.action_cfg.get("ring_yz_eps", 0.07))
+        self.ring_align_step_max = float(self.action_cfg.get("ring_align_step_max", 0.12))
+        self.ring_align_gain = float(self.action_cfg.get("ring_align_gain", 0.75))
+        self.ring_min_confidence = float(self.action_cfg.get("ring_min_confidence", 0.70))
+        self.ring_min_stable_count = int(self.action_cfg.get("ring_min_stable_count", 3))
+        self.ring_forward_min = float(self.action_cfg.get("ring_forward_min", 0.30))
+        self.ring_forward_max = float(self.action_cfg.get("ring_forward_max", 3.50))
+        self.ring_min_z = float(self.action_cfg.get("ring_min_z", 1.35))
+        self.ring_max_z = float(self.action_cfg.get("ring_max_z", 1.85))
 
         # ---------- 是否自动切模式、自动解锁 ----------
         self.auto_set_mode = rospy.get_param("~auto_set_mode", False)
@@ -281,6 +336,19 @@ class MicroUAVStage1FSM:
         self.target_class_1_done = False
         self.target_class_2_done = False
         self.image_drop_count = 0
+
+        # ---------- 图片靶 / 特殊靶视觉闭环缓存 ----------
+        # vision_results[target] 保存 /uav/vision_result 的最近一次 JSON 结果。
+        # action_hold_target 是 ACTION 阶段的动态悬停点，视觉对准时会在原航点附近小范围更新。
+        self.vision_results = {}
+        self.action_hold_target = None
+        self.drop_sent_time = None
+
+        # ---------- 圆环动态航点缓存 ----------
+        # RING_SEARCH_START 识别到圆环后，会把 RING_PRE / RING_CENTER / RING_POST 替换为动态绝对坐标。
+        self.dynamic_ring_points = {}
+        self.ring_dynamic_ready = False
+        self.ring_last_debug = {}
 
         # ---------- ROS 发布 ----------
         self.raw_pub = rospy.Publisher(
@@ -367,6 +435,13 @@ class MicroUAVStage1FSM:
             "/uav/image_class",
             String,
             self.image_class_cb,
+            queue_size=10
+        )
+
+        self.vision_result_sub = rospy.Subscriber(
+            "/uav/vision_result",
+            String,
+            self.vision_result_cb,
             queue_size=10
         )
 
@@ -571,7 +646,15 @@ class MicroUAVStage1FSM:
                 ax = (vx - self.last_vel[0]) / dt
                 ay = (vy - self.last_vel[1]) / dt
                 az = (vz - self.last_vel[2]) / dt
-                self.current_acc_norm = norm3(ax, ay, az)
+                raw_acc_norm = norm3(ax, ay, az)
+
+                # 速度差分会把测量抖动放大成“假加速度”。
+                # 先低通再参与日志/可选判稳，避免单帧尖峰不断清零 stable 计时。
+                alpha = clamp(getattr(self, "acc_lpf_alpha", 0.25), 0.0, 1.0)
+                self.current_acc_norm = (
+                    alpha * raw_acc_norm +
+                    (1.0 - alpha) * self.current_acc_norm
+                )
 
         self.last_vel = [vx, vy, vz]
         self.last_vel_time = now
@@ -595,7 +678,52 @@ class MicroUAVStage1FSM:
 
     def image_class_cb(self, msg):
         """接收当前图片靶类别，视觉节点建议发布 CIFAR-100 英文类别名。"""
-        self.current_image_class = msg.data.strip()
+        self.current_image_class = msg.data.strip().lower()
+
+    def vision_result_cb(self, msg):
+        """
+        接收视觉节点统一结果。
+        控制闭环只使用米制偏差 offset_x_m / offset_y_m；像素字段只用于视觉节点调试。
+        期望 JSON 示例：
+        {
+          "target": "image_target",
+          "detected": true,
+          "class_name": "apple",
+          "offset_x_m": 0.04,
+          "offset_y_m": -0.03,
+          "confidence": 0.90,
+          "stable_count": 5
+        }
+        圆环示例：
+        {
+          "target": "ring_gate",
+          "detected": true,
+          "forward_m": 1.20,
+          "offset_y_m": -0.05,
+          "offset_z_m": 0.03,
+          "confidence": 0.86,
+          "stable_count": 4
+        }
+        """
+        try:
+            data = json.loads(msg.data)
+        except Exception as e:
+            rospy.logwarn_throttle(1.0, "Invalid /uav/vision_result JSON: %s", str(e))
+            return
+
+        target = str(data.get("target", "")).strip().lower()
+
+        if target not in ["image_target", "special_target", "ring_gate"]:
+            return
+
+        data["_recv_time"] = rospy.Time.now()
+        self.vision_results[target] = data
+
+        # 兼容旧的 /uav/image_class 逻辑：新视觉结果里带 class_name 时也更新 current_image_class。
+        if target == "image_target":
+            class_name = str(data.get("class_name", "")).strip().lower()
+            if class_name != "":
+                self.current_image_class = class_name
 
     def start_cb(self, msg):
         """收到 /uav/start=True 后，才允许进入 WAIT_FCU、起飞和任务。"""
@@ -811,6 +939,12 @@ class MicroUAVStage1FSM:
 
     def get_abs_wp(self, wp):
         """将 YAML 中的相对航点转换成 MAVROS local 坐标。"""
+        # 圆环搜索成功后，RING_PRE / RING_CENTER / RING_POST 使用动态绝对坐标，
+        # 不再使用 YAML 中的默认固定点。RING_SEARCH_START 仍使用 YAML 固定搜索点。
+        if wp.name in self.dynamic_ring_points:
+            rx, ry, rz = self.dynamic_ring_points[wp.name]
+            return rx, ry, rz, wp.yaw_rad()
+
         rel_x = wp.x
         rel_y = wp.y
 
@@ -836,6 +970,8 @@ class MicroUAVStage1FSM:
         self.action_start_time = None
         self.action_stable_start_time = None
         self.action_sent = False
+        self.action_hold_target = None
+        self.drop_sent_time = None
         self.cmd_vel = [0.0, 0.0, 0.0]
 
         rospy.loginfo("FSM -> %s", new_state)
@@ -846,6 +982,11 @@ class MicroUAVStage1FSM:
         self.phase_start_time = rospy.Time.now()
         self.stable_start_time = None
         self.cmd_vel = [0.0, 0.0, 0.0]
+
+        if new_phase == "INIT":
+            # 每进入新航点，清除上一靶的动态对准目标和投放计时，避免旧偏差污染下一靶。
+            self.action_hold_target = None
+            self.drop_sent_time = None
 
         rospy.loginfo("NAV_PHASE -> %s", new_phase)
 
@@ -872,6 +1013,12 @@ class MicroUAVStage1FSM:
             self.target_class_1_done = False
             self.target_class_2_done = False
             self.image_drop_count = 0
+            self.vision_results = {}
+            self.action_hold_target = None
+            self.drop_sent_time = None
+            self.dynamic_ring_points = {}
+            self.ring_dynamic_ready = False
+            self.ring_last_debug = {}
 
         self.nav_phase = "INIT"
         self.locked_yaw = self.current_yaw
@@ -881,6 +1028,8 @@ class MicroUAVStage1FSM:
         self.action_start_time = None
         self.action_stable_start_time = None
         self.action_sent = False
+        self.action_hold_target = None
+        self.drop_sent_time = None
 
     def cancel_task_outputs(self):
         """关闭扫描输出，并清除本 FSM 的动作状态。"""
@@ -889,15 +1038,23 @@ class MicroUAVStage1FSM:
         self.action_sent = False
         self.action_start_time = None
         self.action_stable_start_time = None
+        self.action_hold_target = None
+        self.drop_sent_time = None
 
     def is_yaw_aligned(self, target_yaw):
         """判断 yaw 是否对齐。"""
         yaw_err = abs(wrap_pi(target_yaw - self.current_yaw))
         return yaw_err < self.yaw_eps
 
-    def is_speed_acc_stable(self, vel_th, acc_th):
-        """判断当前速度和加速度是否满足稳定条件。"""
-        return self.current_speed < vel_th and self.current_acc_norm < acc_th
+    def is_speed_acc_stable(self, vel_th, acc_th=None):
+        """判断当前速度是否稳定；acc_th 为空或 <= 0 时不启用加速度硬门槛。"""
+        if self.current_speed >= vel_th:
+            return False
+
+        if acc_th is None or acc_th <= 0.0:
+            return True
+
+        return self.current_acc_norm < acc_th
 
     def publish_fsm_state(self):
         """发布当前 FSM 状态，便于地面站显示。"""
@@ -1117,7 +1274,7 @@ class MicroUAVStage1FSM:
     # =========================
 
     def process_takeoff(self):
-        """起飞到指定高度，并确认停稳。"""
+        """起飞到指定高度，并确认达到可继续执行任务的安全悬停状态。"""
         target_x = self.home_x
         target_y = self.home_y
         target_z = self.home_z + self.takeoff_height
@@ -1135,19 +1292,29 @@ class MicroUAVStage1FSM:
 
         cx, cy, cz = self.current_xyz()
 
-        pos_err = norm3(
-            target_x - cx,
-            target_y - cy,
-            target_z - cz
+        xy_err = norm3(target_x - cx, target_y - cy, 0.0)
+        z_err = abs(target_z - cz)
+        pos_err = norm3(target_x - cx, target_y - cy, target_z - cz)
+        height = cz - self.home_z
+        takeoff_elapsed = (rospy.Time.now() - self.phase_start_time).to_sec()
+
+        height_ok = height >= self.takeoff_min_height
+        pos_ready = pos_err < self.takeoff_pos_eps
+        speed_ready = self.current_speed < self.takeoff_stable_vel
+        acc_ready = self.current_acc_norm < self.takeoff_stable_acc
+
+        strict_stable = height_ok and pos_ready and speed_ready and acc_ready
+
+        # 实机可能因为定位/速度抖动长期过不了严格 acc 门槛。
+        # 只要高度安全、位置没有明显偏离、速度已经很低，超过 max_wait 后允许进入任务。
+        soft_ready = (
+            height_ok and
+            xy_err < max(0.25, self.takeoff_pos_eps * 1.5) and
+            z_err < max(0.22, self.takeoff_pos_eps * 1.5) and
+            self.current_speed < max(0.25, self.takeoff_stable_vel * 1.3)
         )
 
-        stable = (
-            pos_err < self.scan_pos_eps and
-            self.current_speed < self.scan_stable_vel and
-            self.current_acc_norm < self.scan_stable_acc
-        )
-
-        if stable:
+        if strict_stable:
             if self.stable_start_time is None:
                 self.stable_start_time = rospy.Time.now()
 
@@ -1159,13 +1326,31 @@ class MicroUAVStage1FSM:
         else:
             self.stable_start_time = None
 
+            if takeoff_elapsed > self.takeoff_max_wait and soft_ready:
+                rospy.logwarn(
+                    "[TAKEOFF] strict stable timeout, continue by soft gate: "
+                    "pos=%.2f xy=%.2f zerr=%.2f height=%.2f vel=%.2f acc=%.2f",
+                    pos_err,
+                    xy_err,
+                    z_err,
+                    height,
+                    self.current_speed,
+                    self.current_acc_norm
+                )
+                self.enter_fsm_state("MISSION")
+                self.enter_nav_phase("INIT")
+
         rospy.loginfo_throttle(
             0.5,
-            "[TAKEOFF] err=%.2f vel=%.2f acc=%.2f stable=%s",
+            "[TAKEOFF] pos=%.2f xy=%.2f zerr=%.2f h=%.2f vel=%.2f acc=%.2f strict=%s soft=%s",
             pos_err,
+            xy_err,
+            z_err,
+            height,
             self.current_speed,
             self.current_acc_norm,
-            str(stable)
+            str(strict_stable),
+            str(soft_ready)
         )
 
     # =========================
@@ -1315,21 +1500,40 @@ class MicroUAVStage1FSM:
             self.publish_velocity_yaw(0.0, 0.0, 0.0, self.locked_yaw)
 
             yaw_ready = self.is_yaw_aligned(self.locked_yaw)
+            # 每个航点都会经过 YAW_ALIGN。默认只看 yaw + 低速，
+            # 不再让速度差分得到的 acc 把每个航点开始前都卡住。
+            yaw_acc_th = self.route_finish_acc if self.yaw_align_use_acc_gate else None
             stable_ready = self.is_speed_acc_stable(
                 self.route_finish_vel,
-                self.route_finish_acc
+                yaw_acc_th
             )
 
-            if yaw_ready and stable_ready:
+            yaw_elapsed = (rospy.Time.now() - self.phase_start_time).to_sec()
+            soft_yaw_ready = (
+                yaw_ready and
+                yaw_elapsed > self.yaw_align_soft_wait and
+                self.current_speed < self.yaw_align_soft_vel
+            )
+
+            if yaw_ready and (stable_ready or soft_yaw_ready):
+                if soft_yaw_ready and not stable_ready:
+                    rospy.logwarn(
+                        "[YAW_ALIGN] soft pass wp=%s vel=%.2f acc=%.2f",
+                        wp.name,
+                        self.current_speed,
+                        self.current_acc_norm
+                    )
                 self.enter_nav_phase("MOVE")
 
             rospy.loginfo_throttle(
                 0.5,
-                "[YAW_ALIGN] wp=%s yaw_err=%.1f deg vel=%.2f acc=%.2f mode=%s",
+                "[YAW_ALIGN] wp=%s yaw_err=%.1f deg vel=%.2f acc=%.2f stable=%s soft=%s mode=%s",
                 wp.name,
                 math.degrees(abs(wrap_pi(self.locked_yaw - self.current_yaw))),
                 self.current_speed,
                 self.current_acc_norm,
+                str(stable_ready),
+                str(soft_yaw_ready),
                 wp.control_mode
             )
 
@@ -1371,15 +1575,33 @@ class MicroUAVStage1FSM:
 
             if wp.kind == "scan" or wp.control_mode == "fusion":
                 vel_th = self.scan_stable_vel
-                acc_th = self.scan_stable_acc
+                acc_th = self.scan_stable_acc if self.action_use_acc_gate else None
             else:
                 vel_th = self.route_finish_vel
-                acc_th = self.route_finish_acc
+                # 普通路线点只要求“到点 + 低速”，不再用加速度硬卡。
+                acc_th = None
 
             pos_ready = dist < arrive_eps
             stable_ready = pos_ready and self.is_speed_acc_stable(vel_th, acc_th)
 
-            if stable_ready:
+            brake_elapsed = (rospy.Time.now() - self.phase_start_time).to_sec()
+            soft_route_ready = (
+                wp.action == "none" and
+                brake_elapsed > self.brake_timeout and
+                dist < max(arrive_eps * 1.5, arrive_eps + 0.08) and
+                self.current_speed < self.brake_soft_vel
+            )
+
+            if stable_ready or soft_route_ready:
+                if soft_route_ready and not stable_ready:
+                    rospy.logwarn(
+                        "[BRAKE] soft pass wp=%s dist=%.2f vel=%.2f acc=%.2f",
+                        wp.name,
+                        dist,
+                        self.current_speed,
+                        self.current_acc_norm
+                    )
+
                 if wp.action == "none":
                     self.next_waypoint()
                 else:
@@ -1387,13 +1609,15 @@ class MicroUAVStage1FSM:
 
             rospy.loginfo_throttle(
                 0.5,
-                "[POSITION_LOCK_BRAKE] wp=%s dist=%.2f eps=%.2f vel=%.2f acc=%.2f pos_ok=%s",
+                "[POSITION_LOCK_BRAKE] wp=%s dist=%.2f eps=%.2f vel=%.2f acc=%.2f pos_ok=%s stable=%s soft=%s",
                 wp.name,
                 dist,
                 arrive_eps,
                 self.current_speed,
                 self.current_acc_norm,
-                str(pos_ready)
+                str(pos_ready),
+                str(stable_ready),
+                str(soft_route_ready)
             )
 
             return
@@ -1534,15 +1758,14 @@ class MicroUAVStage1FSM:
 
     def action_requires_static_hover(self, wp):
         """
-        判断当前 ACTION 是否必须静态悬停。
-        2026-05-23 修改：取消扫描搜索移动后，二维码、图片靶、特殊靶识别/投放都按静态动作处理。
+        判断当前 ACTION 是否必须锁死在原航点静态悬停。
+        图片靶 image_scan_maybe_drop 和特殊靶 special_drop 现在需要视觉闭环小范围修正，
+        因此不再放进这个静态列表。
         """
         return wp.action in [
             "qr_scan",
             "image_drop_1",
             "image_drop_2",
-            "image_scan_maybe_drop",
-            "special_drop",
         ]
 
     def check_action_static_stable(self, tx, ty, tz):
@@ -1555,63 +1778,321 @@ class MicroUAVStage1FSM:
 
         stable = (
             pos_err < self.scan_pos_eps and
-            self.current_speed < self.scan_stable_vel and
-            self.current_acc_norm < self.scan_stable_acc
+            self.current_speed < self.scan_stable_vel
         )
 
+        if self.action_use_acc_gate:
+            stable = stable and self.current_acc_norm < self.scan_stable_acc
+
         return stable, pos_err
+
+    def get_action_hold_target(self, tx, ty, tz):
+        """读取 ACTION 阶段真正的悬停目标点；如果没有动态目标，则使用当前航点。"""
+        if self.action_hold_target is None:
+            self.action_hold_target = [tx, ty, tz]
+
+        return (
+            self.action_hold_target[0],
+            self.action_hold_target[1],
+            self.action_hold_target[2]
+        )
+
+    def get_latest_vision_result(self, target, min_confidence=None):
+        """读取指定 target 的最新视觉结果，并检查超时、detected 和置信度。"""
+        if target not in self.vision_results:
+            return None, "no_result"
+
+        data = self.vision_results[target]
+        recv_time = data.get("_recv_time", None)
+
+        if recv_time is None:
+            return None, "no_recv_time"
+
+        age = (rospy.Time.now() - recv_time).to_sec()
+
+        if age > self.vision_result_timeout:
+            return None, "result_timeout"
+
+        detected_raw = data.get("detected", False)
+        if isinstance(detected_raw, str):
+            detected = detected_raw.strip().lower() in ["true", "1", "yes"]
+        else:
+            detected = bool(detected_raw)
+
+        if not detected:
+            return None, str(data.get("reason", "not_detected"))
+
+        try:
+            confidence = float(data.get("confidence", 1.0))
+        except Exception:
+            return None, "invalid_confidence"
+
+        if min_confidence is None:
+            min_confidence = self.align_min_confidence
+
+        if confidence < min_confidence:
+            return None, "low_confidence"
+
+        return data, "ok"
+
+    def get_vision_offset_xy(self, data):
+        """从视觉结果中读取米制偏差。FSM 不使用像素偏差做控制。"""
+        try:
+            offset_x = float(data.get("offset_x_m"))
+            offset_y = float(data.get("offset_y_m"))
+            return True, offset_x, offset_y
+        except Exception:
+            return False, 0.0, 0.0
+
+    def body_xy_to_local_xy(self, forward, left):
+        """
+        将机体系偏差转换到 MAVROS local 平面坐标。
+        forward > 0 表示目标在机头前方；left > 0 表示目标在机体左侧。
+        """
+        c = math.cos(self.current_yaw)
+        s = math.sin(self.current_yaw)
+
+        dx = c * forward - s * left
+        dy = s * forward + c * left
+
+        return dx, dy
+
+    def update_action_hold_target_by_vision(self, target_z, offset_x_m, offset_y_m):
+        """
+        根据视觉节点给出的米制偏差更新 ACTION 阶段悬停点。
+        视觉偏差定义为：靶心相对投放点的位置。无人机应朝同方向小范围移动。
+        """
+        cx, cy, _ = self.current_xyz()
+        dx_local, dy_local = self.body_xy_to_local_xy(offset_x_m, offset_y_m)
+
+        dx_local, dy_local, _ = limit_vector_norm(
+            dx_local,
+            dy_local,
+            0.0,
+            self.align_step_max
+        )
+
+        self.action_hold_target = [
+            cx + self.align_gain * dx_local,
+            cy + self.align_gain * dy_local,
+            target_z
+        ]
+
+
+    def get_ring_vision_offset(self, data):
+        """
+        读取圆环视觉结果。
+        约定：
+        forward_m > 0：圆环中心在当前机头前方多少米；也兼容 distance_m / range_m 字段。
+        offset_y_m > 0：圆环中心在当前机体左侧。
+        offset_z_m > 0：圆环中心在当前无人机上方。
+        """
+        try:
+            if "forward_m" in data:
+                forward_m = float(data.get("forward_m"))
+            elif "distance_m" in data:
+                forward_m = float(data.get("distance_m"))
+            else:
+                forward_m = float(data.get("range_m"))
+
+            offset_y_m = float(data.get("offset_y_m"))
+            offset_z_m = float(data.get("offset_z_m"))
+        except Exception:
+            return False, 0.0, 0.0, 0.0, "invalid_ring_offset"
+
+        if forward_m < self.ring_forward_min or forward_m > self.ring_forward_max:
+            return False, forward_m, offset_y_m, offset_z_m, "ring_forward_out_of_range"
+
+        return True, forward_m, offset_y_m, offset_z_m, "ok"
+
+    def build_dynamic_ring_points_from_vision(self, forward_m, offset_y_m, offset_z_m, update_pre=True):
+        """
+        根据 ring_gate 视觉结果动态生成穿环三点。
+        视觉结果是当前机体系；生成结果是 MAVROS local 绝对坐标。
+        """
+        cx, cy, cz = self.current_xyz()
+
+        # 当前机体系 forward/left 转 local x/y。
+        dx_local, dy_local = self.body_xy_to_local_xy(forward_m, offset_y_m)
+
+        center_x = cx + dx_local
+        center_y = cy + dy_local
+        center_z = clamp(cz + offset_z_m, self.ring_min_z, self.ring_max_z)
+
+        # 穿越方向按当前锁定 yaw 的机头方向生成，避免视觉轻微抖动影响穿越直线方向。
+        pass_yaw = self.locked_yaw
+        ux = math.cos(pass_yaw)
+        uy = math.sin(pass_yaw)
+
+        pre_x = center_x - ux * self.ring_pre_distance
+        pre_y = center_y - uy * self.ring_pre_distance
+        post_x = center_x + ux * self.ring_post_distance
+        post_y = center_y + uy * self.ring_post_distance
+
+        if update_pre:
+            self.dynamic_ring_points["RING_PRE"] = (pre_x, pre_y, center_z)
+
+        self.dynamic_ring_points["RING_CENTER"] = (center_x, center_y, center_z)
+        self.dynamic_ring_points["RING_POST"] = (post_x, post_y, center_z)
+
+        self.ring_dynamic_ready = True
+        self.ring_last_debug = {
+            "forward_m": forward_m,
+            "offset_y_m": offset_y_m,
+            "offset_z_m": offset_z_m,
+            "center_x": center_x,
+            "center_y": center_y,
+            "center_z": center_z,
+            "pre_x": pre_x,
+            "pre_y": pre_y,
+            "post_x": post_x,
+            "post_y": post_y,
+        }
+
+        rospy.loginfo(
+            "Ring dynamic points updated: PRE=(%.2f, %.2f, %.2f) CENTER=(%.2f, %.2f, %.2f) POST=(%.2f, %.2f, %.2f)",
+            pre_x,
+            pre_y,
+            center_z,
+            center_x,
+            center_y,
+            center_z,
+            post_x,
+            post_y,
+            center_z
+        )
+
+    def update_ring_pre_align_target(self, offset_y_m, offset_z_m):
+        """
+        RING_PRE 二次对准：只根据左右和高度偏差修正，不追 forward_m，避免靠圆环过近。
+        """
+        cx, cy, cz = self.current_xyz()
+        dx_local, dy_local = self.body_xy_to_local_xy(0.0, offset_y_m)
+        dz_local = offset_z_m
+
+        dx_local, dy_local, dz_local = limit_vector_norm(
+            dx_local,
+            dy_local,
+            dz_local,
+            self.ring_align_step_max
+        )
+
+        self.action_hold_target = [
+            cx + self.ring_align_gain * dx_local,
+            cy + self.ring_align_gain * dy_local,
+            clamp(cz + self.ring_align_gain * dz_local, self.ring_min_z, self.ring_max_z)
+        ]
+
+    def send_drop_once(self, drop_cmd):
+        """只发送一次投放命令，并记录投放开始时间。"""
+        if self.action_sent:
+            return False
+
+        self.drop_cmd_pub.publish(String(data=drop_cmd))
+        self.action_sent = True
+        self.drop_sent_time = rospy.Time.now()
+        rospy.loginfo("Drop command sent: %s", drop_cmd)
+        return True
+
+    def drop_wait_finished(self):
+        """投放命令发出后，等待机构动作和额外保持时间结束。"""
+        if self.drop_sent_time is None:
+            return False
+
+        return (rospy.Time.now() - self.drop_sent_time).to_sec() > (
+            self.drop_time + self.hold_after_action
+        )
+
+    def disable_scan_request(self):
+        """统一关闭视觉请求。"""
+        self.scan_enable_pub.publish(Bool(data=False))
+        self.scan_target_pub.publish(String(data="none"))
 
     def process_action(self, wp, tx, ty, tz):
         """
         到达 scan 点后的动作执行。
-        2026-05-23 修改：取消扫描搜索移动，ACTION 阶段只发布固定位置 + 零速度指令。
-        对二维码、图片靶、特殊靶等静态动作，只有持续停稳时才累计有效动作时间。
+        二维码仍然使用静态悬停；图片靶和特殊靶使用视觉节点给出的米制偏差做小范围对准。
         """
-        # 识别/投放阶段不做主动搜索移动：位置锁定在当前航点，速度指令固定为 0。
-        self.publish_position_velocity_yaw(
-            tx,
-            ty,
-            tz,
-            0.0,
-            0.0,
-            0.0,
-            self.locked_yaw
-        )
-
         now = rospy.Time.now()
 
         if self.action_start_time is None:
             self.action_start_time = now
             self.action_stable_start_time = None
             self.action_sent = False
+            self.drop_sent_time = None
+            self.action_hold_target = [tx, ty, tz]
 
             if wp.action == "image_scan_maybe_drop":
                 self.current_image_class = ""
+                self.vision_results.pop("image_target", None)
+
+            if wp.action == "special_drop":
+                self.vision_results.pop("special_target", None)
+
+            if wp.action == "ring_search":
+                self.vision_results.pop("ring_gate", None)
+                self.dynamic_ring_points = {}
+                self.ring_dynamic_ready = False
+                self.ring_last_debug = {}
+
+            if wp.action == "ring_pre_align":
+                self.vision_results.pop("ring_gate", None)
+
+        hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
+
+        # ACTION 阶段始终发布当前悬停目标。视觉对准时 action_hold_target 会在原航点附近更新。
+        self.publish_position_velocity_yaw(
+            hold_tx,
+            hold_ty,
+            hold_tz,
+            0.0,
+            0.0,
+            0.0,
+            self.locked_yaw
+        )
 
         if self.action_requires_static_hover(wp):
-            stable, pos_err = self.check_action_static_stable(tx, ty, tz)
+            stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
+            action_wait = (now - self.action_start_time).to_sec()
+            soft_stable = (
+                (not stable) and
+                action_wait > self.action_soft_timeout and
+                pos_err < self.action_soft_pos_eps and
+                self.current_speed < self.action_soft_vel
+            )
 
-            if stable:
+            if stable or soft_stable:
                 if self.action_stable_start_time is None:
                     self.action_stable_start_time = now
 
-                # 静态识别/投放动作只累计“连续停稳时间”，不再用普通墙钟时间硬跑。
+                if soft_stable:
+                    rospy.logwarn_throttle(
+                        0.8,
+                        "[ACTION] soft stable wp=%s err=%.2f vel=%.2f acc=%.2f",
+                        wp.name,
+                        pos_err,
+                        self.current_speed,
+                        self.current_acc_norm
+                    )
+
+                # 静态识别/投放动作只累计“可接受稳定时间”。
+                # 严格稳定优先；若长期被噪声打断，软稳定也能让动作计时继续推进。
                 action_elapsed = (now - self.action_stable_start_time).to_sec()
             else:
                 self.action_stable_start_time = None
 
                 # 如果还没有发出投放命令，不稳定时先不开启识别有效计时，也不进入投放逻辑。
                 if not self.action_sent:
-                    self.scan_enable_pub.publish(Bool(data=False))
-                    self.scan_target_pub.publish(String(data="none"))
+                    self.disable_scan_request()
 
                     rospy.loginfo_throttle(
                         0.5,
-                        "[ACTION_WAIT_STABLE] wp=%s err=%.2f vel=%.2f acc=%.2f",
+                        "[ACTION_WAIT_STABLE] wp=%s err=%.2f vel=%.2f acc=%.2f soft=%s",
                         wp.name,
                         pos_err,
                         self.current_speed,
-                        self.current_acc_norm
+                        self.current_acc_norm,
+                        str(soft_stable)
                     )
                     return
 
@@ -1637,11 +2118,19 @@ class MicroUAVStage1FSM:
             return
 
         if wp.action == "image_scan_maybe_drop":
-            self.do_image_scan_maybe_drop_action(wp, action_elapsed)
+            self.do_image_scan_maybe_drop_action(wp, tx, ty, tz, action_elapsed)
             return
 
         if wp.action == "special_drop":
-            self.do_drop_only_action(wp, "special_drop", action_elapsed)
+            self.do_special_align_drop_action(wp, tx, ty, tz, action_elapsed)
+            return
+
+        if wp.action == "ring_search":
+            self.do_ring_search_action(wp, tx, ty, tz, action_elapsed)
+            return
+
+        if wp.action == "ring_pre_align":
+            self.do_ring_pre_align_action(wp, tx, ty, tz, action_elapsed)
             return
 
         if wp.action == "ring_wait":
@@ -1665,7 +2154,7 @@ class MicroUAVStage1FSM:
 
             if qr_ok:
                 rospy.loginfo("QR scan success: %s", self.qr_text)
-                self.scan_enable_pub.publish(Bool(data=False))
+                self.disable_scan_request()
                 self.next_waypoint()
                 return
 
@@ -1695,15 +2184,10 @@ class MicroUAVStage1FSM:
         self.scan_target_pub.publish(String(data="image_target"))
 
         if not self.action_sent and elapsed > self.image_scan_time:
-            cmd = String()
-            cmd.data = drop_name
-            self.drop_cmd_pub.publish(cmd)
+            self.send_drop_once(drop_name)
 
-            self.action_sent = True
-            rospy.loginfo("Drop command sent: %s", drop_name)
-
-        if elapsed > self.image_scan_time + self.drop_time + self.hold_after_action:
-            self.scan_enable_pub.publish(Bool(data=False))
+        if self.action_sent and self.drop_wait_finished():
+            self.disable_scan_request()
             self.next_waypoint()
             return
 
@@ -1716,96 +2200,484 @@ class MicroUAVStage1FSM:
             str(self.action_sent)
         )
 
-    def do_image_scan_maybe_drop_action(self, wp, elapsed):
+    def do_image_scan_maybe_drop_action(self, wp, tx, ty, tz, elapsed):
         """
-        图片靶扫描 + 按需投放接口。
-        wait_real_image=false 时：为了调航线，默认在前两个图片靶执行两次投放。
-        wait_real_image=true 时：只有 /uav/image_class 与二维码两个类别之一匹配时才投放。
+        图片靶扫描 + 类别判断 + 视觉对准 + 按二维码目标投放。
+        视觉节点需要通过 /uav/vision_result 提供 image_target 的 class_name、offset_x_m、offset_y_m。
         """
         self.scan_enable_pub.publish(Bool(data=True))
         self.scan_target_pub.publish(String(data="image_target"))
 
-        drop_cmd = ""
+        if self.action_sent:
+            if self.drop_wait_finished():
+                self.disable_scan_request()
+                self.next_waypoint()
+                return
 
-        if elapsed > self.image_scan_time:
-            if self.wait_real_image:
-                img_class = self.current_image_class.strip()
+            rospy.loginfo_throttle(
+                0.5,
+                "[IMAGE_DROP_WAIT] wp=%s elapsed=%.1f",
+                wp.name,
+                elapsed
+            )
+            return
 
-                if img_class == self.qr_class_1 and not self.target_class_1_done:
-                    drop_cmd = "image_drop_1"
+        # 不接真实视觉时保留原来的航线调试占位逻辑：前两个图片靶各投一次。
+        if not self.wait_real_image:
+            drop_cmd = ""
 
-                elif img_class == self.qr_class_2 and not self.target_class_2_done:
-                    drop_cmd = "image_drop_2"
-            else:
-                # 调航线占位逻辑：不接视觉时，前两个图片靶各投一次，保证流程能跑通。
+            if elapsed > self.image_scan_time:
                 if self.image_drop_count == 0:
                     drop_cmd = "image_drop_1"
-
                 elif self.image_drop_count == 1:
                     drop_cmd = "image_drop_2"
+                else:
+                    self.disable_scan_request()
+                    self.next_waypoint()
+                    return
 
-        if drop_cmd != "" and not self.action_sent:
-            self.drop_cmd_pub.publish(String(data=drop_cmd))
-            self.action_sent = True
+            if drop_cmd != "":
+                self.send_drop_once(drop_cmd)
+                self.image_drop_count += 1
+
+                if drop_cmd == "image_drop_1":
+                    self.target_class_1_done = True
+                if drop_cmd == "image_drop_2":
+                    self.target_class_2_done = True
+
+            return
+
+        # 两个二维码类别都已经完成投放时，后续图片靶直接跳过。
+        if self.target_class_1_done and self.target_class_2_done:
+            rospy.loginfo("Both QR image targets already dropped, skip %s.", wp.name)
+            self.disable_scan_request()
+            self.next_waypoint()
+            return
+
+        if elapsed > self.image_align_timeout:
+            rospy.logwarn(
+                "Image target align timeout at %s, skip. class=%s qr=(%s,%s)",
+                wp.name,
+                self.current_image_class,
+                self.qr_class_1,
+                self.qr_class_2
+            )
+            self.disable_scan_request()
+            self.next_waypoint()
+            return
+
+        data, reason = self.get_latest_vision_result("image_target")
+
+        if data is None:
+            rospy.loginfo_throttle(
+                0.5,
+                "[IMAGE_WAIT_VISION] wp=%s reason=%s elapsed=%.1f",
+                wp.name,
+                reason,
+                elapsed
+            )
+            return
+
+        img_class = str(data.get("class_name", self.current_image_class)).strip().lower()
+        self.current_image_class = img_class
+
+        qr_class_1 = self.qr_class_1.strip().lower()
+        qr_class_2 = self.qr_class_2.strip().lower()
+
+        drop_cmd = ""
+
+        if img_class == qr_class_1 and not self.target_class_1_done:
+            drop_cmd = "image_drop_1"
+        elif img_class == qr_class_2 and not self.target_class_2_done:
+            drop_cmd = "image_drop_2"
+
+        # 不是二维码要求类别，或该类别已经投过；给视觉一点时间确认后跳过当前靶。
+        if drop_cmd == "":
+            if elapsed > self.image_scan_time:
+                rospy.loginfo(
+                    "Image target %s class=%s not needed or already dropped, skip.",
+                    wp.name,
+                    img_class
+                )
+                self.disable_scan_request()
+                self.next_waypoint()
+                return
+
+            rospy.loginfo_throttle(
+                0.5,
+                "[IMAGE_CLASS_CHECK] wp=%s class=%s qr=(%s,%s)",
+                wp.name,
+                img_class,
+                self.qr_class_1,
+                self.qr_class_2
+            )
+            return
+
+        ok_offset, offset_x, offset_y = self.get_vision_offset_xy(data)
+
+        if not ok_offset:
+            rospy.logwarn_throttle(
+                0.5,
+                "Image target %s has no valid offset_x_m/offset_y_m.",
+                wp.name
+            )
+            return
+
+        offset_norm = math.sqrt(offset_x * offset_x + offset_y * offset_y)
+
+        if offset_norm > self.align_xy_eps:
+            self.update_action_hold_target_by_vision(tz, offset_x, offset_y)
+
+            rospy.loginfo_throttle(
+                0.5,
+                "[IMAGE_ALIGN] wp=%s class=%s offset=(%.3f, %.3f) norm=%.3f target=(%.2f, %.2f, %.2f)",
+                wp.name,
+                img_class,
+                offset_x,
+                offset_y,
+                offset_norm,
+                self.action_hold_target[0],
+                self.action_hold_target[1],
+                self.action_hold_target[2]
+            )
+            return
+
+        stable_count = int(data.get("stable_count", 1))
+        confidence = float(data.get("confidence", 1.0))
+
+        hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
+        hold_stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
+
+        ready_to_drop = (
+            confidence >= self.align_min_confidence and
+            stable_count >= self.align_min_stable_count and
+            hold_stable
+        )
+
+        if ready_to_drop:
+            self.send_drop_once(drop_cmd)
             self.image_drop_count += 1
 
             if drop_cmd == "image_drop_1":
                 self.target_class_1_done = True
-
             if drop_cmd == "image_drop_2":
                 self.target_class_2_done = True
 
             rospy.loginfo(
-                "Image target matched, drop command sent: %s, image_class=%s",
+                "Image aligned and dropped: wp=%s class=%s cmd=%s offset=%.3f",
+                wp.name,
+                img_class,
                 drop_cmd,
-                self.current_image_class
+                offset_norm
             )
-
-        if self.action_sent:
-            if elapsed > self.image_scan_time + self.drop_time + self.hold_after_action:
-                self.scan_enable_pub.publish(Bool(data=False))
-                self.next_waypoint()
-                return
-        else:
-            if elapsed > self.image_scan_time + self.hold_after_action:
-                self.scan_enable_pub.publish(Bool(data=False))
-                self.next_waypoint()
-                return
+            return
 
         rospy.loginfo_throttle(
             0.5,
-            "[ACTION_IMAGE_SCAN_MAYBE_DROP] wp=%s class=%s qr=(%s,%s) drop_count=%d sent=%s",
+            "[IMAGE_READY_WAIT] wp=%s class=%s offset=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
             wp.name,
-            self.current_image_class,
-            self.qr_class_1,
-            self.qr_class_2,
-            self.image_drop_count,
-            str(self.action_sent)
+            img_class,
+            offset_norm,
+            confidence,
+            stable_count,
+            self.align_min_stable_count,
+            pos_err,
+            str(hold_stable)
+        )
+
+    def do_special_align_drop_action(self, wp, tx, ty, tz, elapsed):
+        """
+        特殊靶视觉对准 + 投放。
+        视觉节点需要通过 /uav/vision_result 提供 special_target 的 offset_x_m、offset_y_m。
+        """
+        self.scan_enable_pub.publish(Bool(data=True))
+        self.scan_target_pub.publish(String(data="special_target"))
+
+        if self.action_sent:
+            if self.drop_wait_finished():
+                self.disable_scan_request()
+                self.next_waypoint()
+                return
+
+            rospy.loginfo_throttle(
+                0.5,
+                "[SPECIAL_DROP_WAIT] wp=%s elapsed=%.1f",
+                wp.name,
+                elapsed
+            )
+            return
+
+        # 调航线时如果不接真实视觉，特殊靶保留旧的直接投放占位逻辑。
+        if not self.wait_real_image:
+            self.send_drop_once("special_drop")
+            return
+
+        if elapsed > self.special_align_timeout:
+            rospy.logwarn("Special target align timeout at %s, skip.", wp.name)
+            self.disable_scan_request()
+            self.next_waypoint()
+            return
+
+        data, reason = self.get_latest_vision_result("special_target")
+
+        if data is None:
+            rospy.loginfo_throttle(
+                0.5,
+                "[SPECIAL_WAIT_VISION] wp=%s reason=%s elapsed=%.1f",
+                wp.name,
+                reason,
+                elapsed
+            )
+            return
+
+        ok_offset, offset_x, offset_y = self.get_vision_offset_xy(data)
+
+        if not ok_offset:
+            rospy.logwarn_throttle(
+                0.5,
+                "Special target %s has no valid offset_x_m/offset_y_m.",
+                wp.name
+            )
+            return
+
+        offset_norm = math.sqrt(offset_x * offset_x + offset_y * offset_y)
+
+        if offset_norm > self.align_xy_eps:
+            self.update_action_hold_target_by_vision(tz, offset_x, offset_y)
+
+            rospy.loginfo_throttle(
+                0.5,
+                "[SPECIAL_ALIGN] wp=%s offset=(%.3f, %.3f) norm=%.3f target=(%.2f, %.2f, %.2f)",
+                wp.name,
+                offset_x,
+                offset_y,
+                offset_norm,
+                self.action_hold_target[0],
+                self.action_hold_target[1],
+                self.action_hold_target[2]
+            )
+            return
+
+        stable_count = int(data.get("stable_count", 1))
+        confidence = float(data.get("confidence", 1.0))
+
+        hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
+        hold_stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
+
+        ready_to_drop = (
+            confidence >= self.align_min_confidence and
+            stable_count >= self.align_min_stable_count and
+            hold_stable
+        )
+
+        if ready_to_drop:
+            self.send_drop_once("special_drop")
+            rospy.loginfo(
+                "Special target aligned and dropped: wp=%s offset=%.3f",
+                wp.name,
+                offset_norm
+            )
+            return
+
+        rospy.loginfo_throttle(
+            0.5,
+            "[SPECIAL_READY_WAIT] wp=%s offset=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
+            wp.name,
+            offset_norm,
+            confidence,
+            stable_count,
+            self.align_min_stable_count,
+            pos_err,
+            str(hold_stable)
         )
 
     def do_drop_only_action(self, wp, drop_name, elapsed):
-        """特殊靶投放动作接口。"""
+        """保留旧接口备用；当前 special_drop 已改用 do_special_align_drop_action。"""
         self.scan_enable_pub.publish(Bool(data=True))
         self.scan_target_pub.publish(String(data="special_target"))
 
         if not self.action_sent:
-            cmd = String()
-            cmd.data = drop_name
-            self.drop_cmd_pub.publish(cmd)
+            self.send_drop_once(drop_name)
 
-            self.action_sent = True
-            rospy.loginfo("Drop command sent: %s", drop_name)
-
-        if elapsed > self.drop_time + self.hold_after_action:
-            self.scan_enable_pub.publish(Bool(data=False))
+        if self.drop_wait_finished():
+            self.disable_scan_request()
             self.next_waypoint()
             return
 
         rospy.loginfo_throttle(
             0.5,
-            "[ACTION_SPECIAL_DROP] wp=%s elapsed=%.1f",
+            "[ACTION_DROP_ONLY] wp=%s cmd=%s elapsed=%.1f",
             wp.name,
+            drop_name,
             elapsed
+        )
+
+
+    def do_ring_search_action(self, wp, tx, ty, tz, elapsed):
+        """
+        圆环搜索锁定：在 RING_SEARCH_START 停稳后请求视觉节点识别 ring_gate，
+        根据 forward_m / offset_y_m / offset_z_m 动态生成 RING_PRE / RING_CENTER / RING_POST。
+        """
+        self.scan_enable_pub.publish(Bool(data=True))
+        self.scan_target_pub.publish(String(data="ring_gate"))
+
+        if not self.wait_real_ring:
+            if elapsed > wp.hold_time:
+                rospy.logwarn("wait_real_ring=false, keep YAML fixed ring points.")
+                self.disable_scan_request()
+                self.next_waypoint()
+            return
+
+        data, reason = self.get_latest_vision_result("ring_gate", min_confidence=self.ring_min_confidence)
+
+        if data is None:
+            if elapsed > self.ring_search_timeout:
+                rospy.logwarn(
+                    "Ring search timeout at %s, policy=%s, reason=%s",
+                    wp.name,
+                    self.ring_timeout_policy,
+                    reason
+                )
+
+                if self.ring_timeout_policy in ["fixed", "continue"]:
+                    rospy.logwarn("Ring timeout: continue with YAML fixed ring points.")
+                    self.disable_scan_request()
+                    self.next_waypoint()
+                    return
+
+                if self.ring_timeout_policy == "skip":
+                    rospy.logwarn("Ring timeout: skip to next waypoint with current route.")
+                    self.disable_scan_request()
+                    self.next_waypoint()
+                    return
+
+                self.publish_safety_state("RING_SEARCH_HOLD")
+                rospy.logwarn_throttle(1.0, "Ring search timeout, holding and waiting for valid ring vision.")
+                return
+
+            rospy.loginfo_throttle(
+                0.5,
+                "[RING_SEARCH_WAIT] wp=%s reason=%s elapsed=%.1f",
+                wp.name,
+                reason,
+                elapsed
+            )
+            return
+
+        ok, forward_m, offset_y_m, offset_z_m, reason = self.get_ring_vision_offset(data)
+        if not ok:
+            rospy.logwarn_throttle(0.5, "Invalid ring vision: %s", reason)
+            return
+
+        stable_count = int(data.get("stable_count", 1))
+        confidence = float(data.get("confidence", 1.0))
+
+        if stable_count < self.ring_min_stable_count:
+            rospy.loginfo_throttle(
+                0.5,
+                "[RING_SEARCH_STABLE_WAIT] forward=%.2f y=%.2f z=%.2f conf=%.2f stable=%d/%d",
+                forward_m,
+                offset_y_m,
+                offset_z_m,
+                confidence,
+                stable_count,
+                self.ring_min_stable_count
+            )
+            return
+
+        self.build_dynamic_ring_points_from_vision(forward_m, offset_y_m, offset_z_m, update_pre=True)
+        self.disable_scan_request()
+        self.next_waypoint()
+
+    def do_ring_pre_align_action(self, wp, tx, ty, tz, elapsed):
+        """
+        RING_PRE 二次对准：到动态预穿越点后，继续看圆环，修正左右和高度；
+        偏差足够小后，用最新视觉结果更新 RING_CENTER / RING_POST，然后连续穿越。
+        """
+        self.scan_enable_pub.publish(Bool(data=True))
+        self.scan_target_pub.publish(String(data="ring_gate"))
+
+        if not self.wait_real_ring:
+            if elapsed > wp.hold_time:
+                self.disable_scan_request()
+                self.next_waypoint()
+            return
+
+        if elapsed > self.ring_align_timeout:
+            rospy.logwarn("Ring pre-align timeout at %s, continue through current dynamic/fixed points.", wp.name)
+            self.disable_scan_request()
+            self.next_waypoint()
+            return
+
+        data, reason = self.get_latest_vision_result("ring_gate", min_confidence=self.ring_min_confidence)
+
+        if data is None:
+            rospy.loginfo_throttle(
+                0.5,
+                "[RING_PRE_WAIT_VISION] wp=%s reason=%s elapsed=%.1f",
+                wp.name,
+                reason,
+                elapsed
+            )
+            return
+
+        ok, forward_m, offset_y_m, offset_z_m, reason = self.get_ring_vision_offset(data)
+        if not ok:
+            rospy.logwarn_throttle(0.5, "Invalid ring pre-align vision: %s", reason)
+            return
+
+        yz_err = math.sqrt(offset_y_m * offset_y_m + offset_z_m * offset_z_m)
+
+        if yz_err > self.ring_yz_eps:
+            self.update_ring_pre_align_target(offset_y_m, offset_z_m)
+            rospy.loginfo_throttle(
+                0.5,
+                "[RING_PRE_ALIGN] y=%.3f z=%.3f err=%.3f target=(%.2f, %.2f, %.2f)",
+                offset_y_m,
+                offset_z_m,
+                yz_err,
+                self.action_hold_target[0],
+                self.action_hold_target[1],
+                self.action_hold_target[2]
+            )
+            return
+
+        stable_count = int(data.get("stable_count", 1))
+        confidence = float(data.get("confidence", 1.0))
+        hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
+        hold_stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
+
+        ready_to_pass = (
+            confidence >= self.ring_min_confidence and
+            stable_count >= self.ring_min_stable_count and
+            hold_stable
+        )
+
+        if ready_to_pass:
+            # 用 RING_PRE 位置的最新视觉结果刷新 CENTER/POST；PRE 不再重写，避免来回跳。
+            self.build_dynamic_ring_points_from_vision(forward_m, offset_y_m, offset_z_m, update_pre=False)
+            self.disable_scan_request()
+            rospy.loginfo(
+                "Ring pre-align ready: forward=%.2f y=%.3f z=%.3f err=%.3f. Start passing gate.",
+                forward_m,
+                offset_y_m,
+                offset_z_m,
+                yz_err
+            )
+            self.next_waypoint()
+            return
+
+        rospy.loginfo_throttle(
+            0.5,
+            "[RING_PRE_READY_WAIT] y=%.3f z=%.3f err=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
+            offset_y_m,
+            offset_z_m,
+            yz_err,
+            confidence,
+            stable_count,
+            self.ring_min_stable_count,
+            pos_err,
+            str(hold_stable)
         )
 
     def do_mission_done_action(self, wp, elapsed):
