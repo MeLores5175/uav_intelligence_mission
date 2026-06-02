@@ -16,10 +16,33 @@ import socket
 import time
 
 
-UAV_IP = "10.82.0.168"
+UAV_IP = "10.198.228.118"
 UAV_PORT = 8888
 
 RECV_TIMEOUT = 1.0
+
+
+def print_ping_result(reply):
+    """
+    把接收节点返回的 PING 状态翻译成更直接的调试提示。
+    """
+    if reply.startswith("ACK:PING:NORMAL"):
+        print("PING 结果：UDP 接收节点在线，FSM 状态机心跳正常。")
+        return
+
+    if reply.startswith("ACK:PING:RECEIVER_OK"):
+        if "fsm=NO_HEARTBEAT" in reply:
+            print("PING 结果：UDP 接收节点在线，但还没收到 FSM 状态机心跳。")
+            return
+
+        if "fsm=TIMEOUT" in reply:
+            print("PING 结果：UDP 接收节点在线，但 FSM 状态机心跳超时。")
+            return
+
+        print("PING 结果：UDP 接收节点在线，FSM 状态未知。")
+        return
+
+    print("PING 结果：收到未知 PING 回传，请检查接收节点版本。")
 
 
 def send_cmd(sock, cmd):
@@ -52,6 +75,9 @@ def send_cmd(sock, cmd):
         reply = data.decode("utf-8", errors="ignore").strip()
         print("收到回传：", reply)
         print("来自：", from_addr[0], from_addr[1])
+
+        if msg == "CMD:PING":
+            print_ping_result(reply)
     except socket.timeout:
         print("等待回传超时。可能是无人机没收到、IP/端口不对，或无人机端节点没启动。")
     except Exception as e:
@@ -63,7 +89,7 @@ def print_help():
     print("无人机地址：{}:{}".format(UAV_IP, UAV_PORT))
     print("")
     print("可输入命令：")
-    print("  ping      测试通信")
+    print("  ping      测试 UDP 通信，并检查 FSM 状态机心跳")
     print("  status    查询无人机 FSM / MAVROS 状态")
     print("  start     发布 /uav/start=True，开始任务")
     print("  land      发布 /uav/land=True，普通 AUTO.LAND")

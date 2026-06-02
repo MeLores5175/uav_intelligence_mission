@@ -40,6 +40,7 @@ class UdpUavCmdReceiver:
         # 可选安全口令。默认空，不校验。
         # 若设置 _auth_token:=abc123，则电脑端需要发送 CMD:START:abc123
         self.auth_token = str(rospy.get_param("~auth_token", "")).strip()
+        self.fsm_heartbeat_timeout = float(rospy.get_param("~fsm_heartbeat_timeout", 2.0))
 
         # FSM 控制话题
         self.start_pub = rospy.Publisher("/uav/start", Bool, queue_size=10)
@@ -52,6 +53,7 @@ class UdpUavCmdReceiver:
         self.fsm_state = "UNKNOWN"
         self.safety_state = "UNKNOWN"
         self.land_status = "UNKNOWN"
+        self.fsm_state_last_time = None
 
         rospy.Subscriber("/uav/fsm_state", String, self.fsm_state_cb, queue_size=10)
         rospy.Subscriber("/uav/safety_state", String, self.safety_state_cb, queue_size=10)
@@ -83,6 +85,7 @@ class UdpUavCmdReceiver:
 
     def fsm_state_cb(self, msg):
         self.fsm_state = msg.data
+        self.fsm_state_last_time = rospy.Time.now()
 
     def safety_state_cb(self, msg):
         self.safety_state = msg.data
@@ -179,6 +182,39 @@ class UdpUavCmdReceiver:
             self.mavros_mode
         )
 
+    def build_ping_text(self):
+        """
+        PING 同时检查 UDP 接收节点和 FSM 心跳。
+        只要本函数能回复，说明 UDP 接收节点在线；最近收到 /uav/fsm_state 则认为 FSM 正常。
+        """
+        if self.fsm_state_last_time is None:
+            return (
+                "ACK:PING:RECEIVER_OK;"
+                "receiver=OK;"
+                "fsm=NO_HEARTBEAT;"
+                "fsm_age=NA;"
+                "state=%s"
+            ) % self.fsm_state
+
+        age = (rospy.Time.now() - self.fsm_state_last_time).to_sec()
+
+        if age <= self.fsm_heartbeat_timeout:
+            return (
+                "ACK:PING:NORMAL;"
+                "receiver=OK;"
+                "fsm=NORMAL;"
+                "fsm_age=%.2f;"
+                "state=%s"
+            ) % (age, self.fsm_state)
+
+        return (
+            "ACK:PING:RECEIVER_OK;"
+            "receiver=OK;"
+            "fsm=TIMEOUT;"
+            "fsm_age=%.2f;"
+            "state=%s"
+        ) % (age, self.fsm_state)
+
     def handle_command(self, raw_text, addr):
         cmd, error = self.parse_command(raw_text)
 
@@ -191,7 +227,7 @@ class UdpUavCmdReceiver:
         rospy.logwarn("UDP command received from %s: CMD:%s", str(addr), cmd)
 
         if cmd == "PING":
-            self.send_reply("ACK:PING:OK", addr)
+            self.send_reply(self.build_ping_text(), addr)
             return
 
         if cmd == "STATUS":
