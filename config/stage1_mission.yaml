@@ -34,6 +34,15 @@ mission:
   landing:
     default_side: left
     approach_x: 1.00
+    # 切 AUTO.LAND 前先用 OFFBOARD 锁当前位置和固定 yaw，降低切模式瞬间机身扭转。
+    # 普通 land 准备时间稍长；stop 急停准备时间很短，只用于让 yaw setpoint 平滑交接。
+    prepare_time: 0.80
+    emergency_prepare_time: 0.20
+    disarm_prepare_time: 0.80
+    prepare_vel_th: 0.20
+    prepare_max_wait: 1.50
+    emergency_prepare_max_wait: 0.35
+    disarm_prepare_max_wait: 1.50
     left:
       x: 0.00
       y: 1.60
