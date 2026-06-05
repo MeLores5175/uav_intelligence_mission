@@ -232,6 +232,27 @@ class MicroUAVStage1FSM:
         self.takeoff_max_wait = float(self.takeoff_cfg.get("max_wait", 5.0))
         self.takeoff_min_height = float(self.takeoff_cfg.get("min_height", 1.20))
 
+        # ---------- 降落切 AUTO.LAND 前的准备保持参数 ----------
+        # 目的：先用 OFFBOARD 锁住当前位置和固定 yaw，降低切 AUTO.LAND 瞬间 yaw 目标跳变导致的机身扭转。
+        self.land_prepare_time = float(self.landing_cfg.get("prepare_time", 0.80))
+        self.emergency_land_prepare_time = float(self.landing_cfg.get("emergency_prepare_time", 0.20))
+        self.disarm_land_prepare_time = float(
+            self.landing_cfg.get("disarm_prepare_time", self.land_prepare_time)
+        )
+        self.land_prepare_vel_th = float(self.landing_cfg.get("prepare_vel_th", 0.20))
+        self.land_prepare_max_wait = float(
+            self.landing_cfg.get("prepare_max_wait", max(1.20, self.land_prepare_time + 0.50))
+        )
+        self.emergency_land_prepare_max_wait = float(
+            self.landing_cfg.get(
+                "emergency_prepare_max_wait",
+                max(0.30, self.emergency_land_prepare_time + 0.15)
+            )
+        )
+        self.disarm_land_prepare_max_wait = float(
+            self.landing_cfg.get("disarm_prepare_max_wait", self.land_prepare_max_wait)
+        )
+
         # ---------- 动作参数 ----------
         self.qr_scan_timeout = float(self.action_cfg.get("qr_scan_timeout", 3.0))
         self.image_scan_time = float(self.action_cfg.get("image_scan_time", 1.5))
@@ -327,6 +348,12 @@ class MicroUAVStage1FSM:
 
         self.last_mode_req = rospy.Time.now()
         self.last_land_req = rospy.Time.now()
+
+        # ---------- 降落准备保持状态 ----------
+        self.land_prepare_start_time = None
+        self.land_prepare_kind = ""
+        self.land_hold_target = None
+        self.land_locked_yaw = None
 
         # ---------- 视觉结果缓存 ----------
         self.qr_text = ""
@@ -797,6 +824,7 @@ class MicroUAVStage1FSM:
             self.land_reason = "/uav/disarm received while airborne"
             self.publish_safety_state("DISARM_WAIT_LAND")
             self.publish_land_status("DISARM_WAIT_LAND")
+            self.setup_landing_prepare("disarm")
             self.enter_fsm_state("DISARMING")
         else:
             self.publish_safety_state("DISARM_DIRECT")
@@ -911,9 +939,12 @@ class MicroUAVStage1FSM:
 
         self.raw_pub.publish(msg)
 
-    def publish_neutral_setpoint(self):
+    def publish_neutral_setpoint(self, yaw=None):
         """发布零速度指令，防止急停/降落前最后一帧旧目标继续推动飞机。"""
-        self.publish_velocity_yaw(0.0, 0.0, 0.0, self.current_yaw)
+        if yaw is None:
+            yaw = self.current_yaw
+
+        self.publish_velocity_yaw(0.0, 0.0, 0.0, yaw)
 
     # =========================
     # 07. FSM 工具函数区
@@ -1043,6 +1074,7 @@ class MicroUAVStage1FSM:
         self.action_sent = False
         self.action_hold_target = None
         self.drop_sent_time = None
+        self.clear_landing_prepare()
 
     def cancel_task_outputs(self):
         """关闭扫描输出，并清除本 FSM 的动作状态。"""
@@ -1053,6 +1085,113 @@ class MicroUAVStage1FSM:
         self.action_stable_start_time = None
         self.action_hold_target = None
         self.drop_sent_time = None
+
+    def clear_landing_prepare(self):
+        """清理降落准备保持状态。"""
+        self.land_prepare_start_time = None
+        self.land_prepare_kind = ""
+        self.land_hold_target = None
+        self.land_locked_yaw = None
+
+    def setup_landing_prepare(self, kind):
+        """记录切 AUTO.LAND 前的保持点和固定 yaw。"""
+        self.land_prepare_start_time = rospy.Time.now()
+        self.land_prepare_kind = kind
+        self.land_locked_yaw = self.current_yaw
+
+        if self.current_pose is not None:
+            cx, cy, cz = self.current_xyz()
+            self.land_hold_target = [cx, cy, cz]
+        else:
+            self.land_hold_target = None
+
+        rospy.logwarn(
+            "Landing prepare locked: kind=%s yaw=%.1f deg hold=%s",
+            kind,
+            math.degrees(self.land_locked_yaw),
+            str(self.land_hold_target)
+        )
+
+    def get_landing_prepare_limits(self):
+        """根据普通降落、急停降落或空中上锁请求选择准备保持时间。"""
+        if self.land_prepare_kind == "emergency":
+            return self.emergency_land_prepare_time, self.emergency_land_prepare_max_wait
+
+        if self.land_prepare_kind == "disarm":
+            return self.disarm_land_prepare_time, self.disarm_land_prepare_max_wait
+
+        return self.land_prepare_time, self.land_prepare_max_wait
+
+    def publish_landing_prepare_setpoint(self):
+        """切 AUTO.LAND 前保持当前位置和固定 yaw，避免 yaw setpoint 随估计值抖动。"""
+        yaw = self.land_locked_yaw
+        if yaw is None:
+            yaw = self.current_yaw
+
+        if self.land_hold_target is not None:
+            self.publish_position_velocity_yaw(
+                self.land_hold_target[0],
+                self.land_hold_target[1],
+                self.land_hold_target[2],
+                0.0,
+                0.0,
+                0.0,
+                yaw
+            )
+        else:
+            self.publish_neutral_setpoint(yaw)
+
+    def landing_prepare_ready(self):
+        """判断切 AUTO.LAND 前的短暂停稳是否完成。"""
+        if self.current_state.mode == "AUTO.LAND":
+            return True
+
+        if self.land_prepare_start_time is None:
+            self.setup_landing_prepare("normal")
+
+        self.publish_landing_prepare_setpoint()
+
+        now = rospy.Time.now()
+        elapsed = (now - self.land_prepare_start_time).to_sec()
+        prepare_time, max_wait = self.get_landing_prepare_limits()
+        speed_ready = self.current_speed < self.land_prepare_vel_th
+
+        ready = (
+            elapsed >= prepare_time and
+            (speed_ready or elapsed >= max_wait)
+        )
+
+        if not ready:
+            if self.land_prepare_kind == "emergency":
+                status = "EMERGENCY_LAND_PREPARE"
+            elif self.land_prepare_kind == "disarm":
+                status = "DISARM_LAND_PREPARE"
+            else:
+                status = "LAND_PREPARE"
+
+            self.publish_land_status(status)
+            rospy.logwarn_throttle(
+                0.3,
+                "[LAND_PREPARE] kind=%s elapsed=%.2f/%.2f max=%.2f speed=%.2f<th=%.2f yaw=%.1f",
+                self.land_prepare_kind,
+                elapsed,
+                prepare_time,
+                max_wait,
+                self.current_speed,
+                self.land_prepare_vel_th,
+                math.degrees(self.land_locked_yaw if self.land_locked_yaw is not None else self.current_yaw)
+            )
+            return False
+
+        if not speed_ready:
+            rospy.logwarn(
+                "[LAND_PREPARE] max wait reached, continue AUTO.LAND: kind=%s elapsed=%.2f speed=%.2f",
+                self.land_prepare_kind,
+                elapsed,
+                self.current_speed
+            )
+
+        return True
 
     def is_yaw_aligned(self, target_yaw):
         """判断 yaw 是否对齐。"""
@@ -1135,6 +1274,7 @@ class MicroUAVStage1FSM:
         self.disarm_after_land = True
         self.publish_safety_state("EMERGENCY_LAND")
         self.publish_land_status("EMERGENCY_LAND_REQUESTED")
+        self.setup_landing_prepare("emergency")
         self.enter_fsm_state("EMERGENCY_LAND")
 
     def request_normal_land(self, reason):
@@ -1151,6 +1291,7 @@ class MicroUAVStage1FSM:
         self.disarm_after_land = True
         self.publish_safety_state("LANDING")
         self.publish_land_status("LAND_REQUESTED")
+        self.setup_landing_prepare("normal")
         self.enter_fsm_state("LANDING")
 
     # =========================
@@ -1196,6 +1337,7 @@ class MicroUAVStage1FSM:
         """请求 PX4 进入 AUTO.LAND 模式。"""
         if not self.current_state.armed:
             self.publish_land_status("DISARMED")
+            self.clear_landing_prepare()
             self.enter_fsm_state("WAIT_RESET")
             return
 
@@ -1230,6 +1372,7 @@ class MicroUAVStage1FSM:
             self.reset_required = True
             self.start_requested = False
             self.disarm_after_land = False
+            self.clear_landing_prepare()
             self.enter_fsm_state("WAIT_RESET")
             return
 
@@ -1253,6 +1396,7 @@ class MicroUAVStage1FSM:
                 self.reset_required = True
                 self.start_requested = False
                 self.disarm_after_land = False
+                self.clear_landing_prepare()
                 self.enter_fsm_state("WAIT_RESET")
                 rospy.logwarn("Disarm requested after PX4 confirmed landed.")
             else:
@@ -1267,15 +1411,19 @@ class MicroUAVStage1FSM:
     def handle_landing(self):
         """统一处理 LANDING / EMERGENCY_LAND / DISARMING。"""
         self.cancel_task_outputs()
-        self.publish_neutral_setpoint()
 
         if not self.current_state.armed:
             self.publish_land_status("DISARMED")
             self.reset_required = True
+            self.clear_landing_prepare()
             self.enter_fsm_state("WAIT_RESET")
             return
 
         if not self.is_landed():
+            if self.current_state.mode != "AUTO.LAND" and not self.landing_prepare_ready():
+                return
+
+            self.publish_landing_prepare_setpoint()
             self.try_set_auto_land()
             return
 

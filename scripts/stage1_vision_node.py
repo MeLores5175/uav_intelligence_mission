@@ -49,7 +49,7 @@ try:
 except Exception:
     YOLO = None
 
-IMAGE_CLASS_YOLO_MODEL_PATH = "/home/nvidia/catkin_ws/src/uav_inventory/models/image_target_classifier.pt"
+IMAGE_CLASS_YOLO_MODEL_PATH = "/home/nvidia/catkin_ws/src/uav_inventory/models/image_target_classifier.engine"
 IMAGE_CLASS_YOLO_TASK = "classify"
 IMAGE_CLASS_YOLO_CONF = 0.25
 

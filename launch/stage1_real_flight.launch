@@ -1,0 +1,115 @@
+<launch>
+    <!--
+        One-key real-flight startup for stage-1 mission.
+
+        Equivalent external starts:
+          roslaunch mavros px4.launch
+          roslaunch livox_ros_driver2 msg_MID360.launch
+          roslaunch faster_lio rflysim.launch
+
+        Then starts:
+          micro_uav_stage1_fsm.py
+          stage1_vision_node.py
+          udp_uav_cmd_receiver.py
+    -->
+
+    <!-- External flight stack / localization nodes -->
+    <arg name="start_mavros" default="true" />
+    <arg name="start_livox" default="true" />
+    <arg name="start_faster_lio" default="true" />
+
+    <!-- Real-flight MAVROS serial link, copied from the previous working launch. -->
+    <arg name="fcu_url" default="/dev/ttyTHS0:921600" />
+    <arg name="gcs_url" default="" />
+    <arg name="tgt_system" default="1" />
+    <arg name="tgt_component" default="1" />
+
+    <!-- Mission nodes -->
+    <arg name="start_fsm" default="true" />
+    <arg name="start_vision" default="true" />
+    <arg name="start_udp_receiver" default="true" />
+
+    <!-- FSM mission config -->
+    <arg name="mission_yaml"
+         default="$(find uav_inventory)/config/stage1_mission.yaml" />
+
+    <!-- Mission still waits for /uav/start. After start, FSM auto-requests OFFBOARD and arm by default. -->
+    <arg name="auto_set_mode" default="true" />
+    <arg name="auto_arm" default="true" />
+
+    <!-- Vision config -->
+    <arg name="down_camera_index" default="0" />
+    <arg name="show_debug" default="false" />
+    <arg name="enable_front_realsense" default="true" />
+
+    <!-- TensorRT engine generated from YOLO classification model. Replace with your real path. -->
+    <arg name="image_class_model_path"
+         default="/home/nvidia/catkin_ws/src/uav_inventory/models/image_target_classifier.engine" />
+    <arg name="image_class_model_task" default="classify" />
+
+    <!-- UDP command receiver config. 0.0.0.0 listens on all network interfaces. -->
+    <arg name="udp_bind_ip" default="0.0.0.0" />
+    <arg name="udp_bind_port" default="8888" />
+    <arg name="udp_auth_token" default="" />
+    <arg name="fsm_heartbeat_timeout" default="2.0" />
+
+    <!-- External launch files -->
+    <include if="$(arg start_mavros)"
+             file="$(find mavros)/launch/px4.launch">
+        <arg name="fcu_url" value="$(arg fcu_url)" />
+        <arg name="gcs_url" value="$(arg gcs_url)" />
+        <arg name="tgt_system" value="$(arg tgt_system)" />
+        <arg name="tgt_component" value="$(arg tgt_component)" />
+    </include>
+
+    <!-- livox_ros_driver2 on this Jetson uses launch_ROS1/, not launch/. -->
+    <include if="$(arg start_livox)"
+             file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+
+    <include if="$(arg start_faster_lio)"
+             file="$(find faster_lio)/launch/rflysim.launch" />
+
+    <!-- FSM -->
+    <node if="$(arg start_fsm)"
+          pkg="uav_inventory"
+          type="micro_uav_stage1_fsm.py"
+          name="micro_uav_stage1_fsm"
+          output="screen">
+        <param name="mission_yaml" value="$(arg mission_yaml)" />
+        <param name="auto_set_mode" value="$(arg auto_set_mode)" />
+        <param name="auto_arm" value="$(arg auto_arm)" />
+    </node>
+
+    <!-- Unified vision node -->
+    <node if="$(arg start_vision)"
+          pkg="uav_inventory"
+          type="stage1_vision_node.py"
+          name="stage1_vision_node"
+          output="screen">
+        <param name="down_camera_index" value="$(arg down_camera_index)" />
+        <param name="show_debug" value="$(arg show_debug)" />
+        <param name="enable_front_realsense" value="$(arg enable_front_realsense)" />
+        <param name="image_class_model_path" value="$(arg image_class_model_path)" />
+        <param name="image_class_model_task" value="$(arg image_class_model_task)" />
+
+        <!-- Down-camera pixel center used as the release point. Tune if the drop point is not exactly image center. -->
+        <param name="down_release_u" value="-1.0" />
+        <param name="down_release_v" value="-1.0" />
+
+        <!-- Default mount assumption: image top is UAV forward, image left is UAV left. -->
+        <param name="body_forward_from_image_down" value="-1.0" />
+        <param name="body_left_from_image_right" value="-1.0" />
+    </node>
+
+    <!-- UDP bridge for simple ground station commands -->
+    <node if="$(arg start_udp_receiver)"
+          pkg="uav_inventory"
+          type="udp_uav_cmd_receiver.py"
+          name="udp_uav_cmd_receiver"
+          output="screen">
+        <param name="bind_ip" value="$(arg udp_bind_ip)" />
+        <param name="bind_port" value="$(arg udp_bind_port)" />
+        <param name="auth_token" value="$(arg udp_auth_token)" />
+        <param name="fsm_heartbeat_timeout" value="$(arg fsm_heartbeat_timeout)" />
+    </node>
+</launch>

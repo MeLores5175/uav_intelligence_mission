@@ -16,8 +16,9 @@ import socket
 import time
 
 
-UAV_IP = "10.198.228.118"
+UAV_IP = "192.168.151.102"
 UAV_PORT = 8888
+BOOT_PORT = UAV_PORT
 
 RECV_TIMEOUT = 1.0
 
@@ -45,7 +46,7 @@ def print_ping_result(reply):
     print("PING 结果：收到未知 PING 回传，请检查接收节点版本。")
 
 
-def send_cmd(sock, cmd):
+def send_cmd(sock, cmd, port=None):
     """
     发送一条 CMD 指令，并等待无人机回传。
     """
@@ -60,7 +61,10 @@ def send_cmd(sock, cmd):
     else:
         msg = cmd
 
-    addr = (UAV_IP, UAV_PORT)
+    if port is None:
+        port = UAV_PORT
+
+    addr = (UAV_IP, port)
 
     print("\n发送：", msg)
 
@@ -87,8 +91,10 @@ def send_cmd(sock, cmd):
 def print_help():
     print("\n========== 简易 UDP 地面站 ==========")
     print("无人机地址：{}:{}".format(UAV_IP, UAV_PORT))
+    print("BOOT 地址：{}:{}".format(UAV_IP, BOOT_PORT))
     print("")
     print("可输入命令：")
+    print("  boot      发送 CMD:BOOT，一键启动实飞 launch")
     print("  ping      测试 UDP 通信，并检查 FSM 状态机心跳")
     print("  status    查询无人机 FSM / MAVROS 状态")
     print("  start     发布 /uav/start=True，开始任务")
@@ -140,6 +146,10 @@ def main():
 
         if cmd == "loop":
             status_loop(sock)
+            continue
+
+        if cmd == "boot":
+            send_cmd(sock, "BOOT", port=BOOT_PORT)
             continue
 
         if cmd in ["ping", "status", "start", "land", "stop", "reset", "disarm"]:
