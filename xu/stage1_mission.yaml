@@ -1,0 +1,504 @@
+# SPEED_PROFILE: 03_aggressive
+# 微型无人机完整任务航点文件（坐标系1）
+# 坐标系1说明：
+# 1. 起飞点为原点 (0, 0)，单位 m；
+# 2. +x 与原比赛图 x 方向相同；
+# 3. +y 与原比赛图 y 方向相反；
+# 4. control_mode = position：普通航段，但 FSM 内部会转成位置 + 速度融合控制，按距离提前减速；
+# 5. control_mode = fusion：精细停靠点，位置 + 速度融合控制，会停稳后执行 action；
+# 6. control_mode = fusion_route：复杂通过点，位置 + 速度融合控制，速度受限但默认不强制刹停；
+# 7. 正式比赛前请按现场实测微调所有 x/y/z，尤其是圆环 x 和降落点映射。
+
+mission:
+  frame: relative_home
+
+  # 起飞参数
+  takeoff:
+    z: 1.35
+    yaw_deg: 0.0
+    # 起飞判稳单独配置：不沿用 scan/drop 的 8cm 严格判据。
+    stable_time: 0.40
+    pos_eps: 0.15
+    stable_vel: 0.18
+    stable_acc: 0.80
+    max_wait: 5.0
+    min_height: 1.20
+
+  # 正式比赛建议 true；如果只想单独调航线，可临时改 false。
+  wait_real_qr: true
+  wait_real_image: true
+  wait_real_ring: true
+
+  # 降落点映射
+  # 当前按之前讨论：left -> 下方 H 点 (0, 1.6)，right -> 上方 H 点 (0, -1.6)。
+  # 若现场二维码 left/right 的判定相反，只需要交换下面 left/right 的 y。
+  landing:
+    default_side: left
+    approach_x: 1.00
+    # 切 AUTO.LAND 前先用 OFFBOARD 锁当前位置和固定 yaw，降低切模式瞬间机身扭转。
+    # 普通 land 准备时间稍长；stop 急停准备时间很短，只用于让 yaw setpoint 平滑交接。
+    prepare_time: 0.80
+    emergency_prepare_time: 0.20
+    disarm_prepare_time: 0.80
+    prepare_vel_th: 0.20
+    prepare_max_wait: 1.50
+    emergency_prepare_max_wait: 0.35
+    disarm_prepare_max_wait: 1.50
+    left:
+      x: 0.00
+      y: 1.60
+    right:
+      x: 0.00
+      y: -1.60
+
+  # 通用控制参数
+  control:
+    rate_hz: 30.0
+
+    yaw_eps_deg: 5.0
+    yaw_break_eps_deg: 12.0
+
+    # 普通 route 点也会走位置 + 速度融合控制。
+    # route_pos_eps 是进入目标点范围的判据；到点后先刹停，再切下一个 position 航点。
+    route_pos_eps: 0.20
+    route_finish_vel: 0.28
+    route_finish_acc: 0.45
+
+    # 判稳防卡死：普通路线点默认不用加速度硬卡，只要求到点 + 低速。
+    acc_lpf_alpha: 0.25
+    yaw_align_use_acc_gate: false
+    yaw_align_soft_wait: 0.80
+    yaw_align_soft_vel: 0.35
+    brake_timeout: 1.20
+    brake_soft_vel: 0.35
+    action_use_acc_gate: false
+
+    # 距离减速参数：小于 slow_radius 后，速度按距离线性下降。
+    # 这些参数是第一版保守值，先解决冲太快和刹不住，再逐步加速。
+    route_slow_radius: 0.65
+    obs_slow_radius: 0.32
+    # 绕障菱形中间点为 fusion_route，不刹停；这里把减速区收小，减少顶点处顿挫。
+    obs_fast_slow_radius: 0.18
+    scan_slow_radius: 0.45
+    ring_slow_radius: 0.60
+    land_slow_radius: 0.85
+    route_min_speed: 0.18
+    scan_min_speed: 0.10
+    ring_min_speed: 0.12
+
+    # scan/drop/ring 精细点用融合控制，要求更稳。
+    # scan_kp 保留为备用参数；当前速度主要由 speed、acc、slow_radius 控制。
+    scan_pos_eps: 0.10
+    scan_kp: 0.65
+    scan_stable_vel: 0.15
+    scan_stable_acc: 0.80
+    scan_stable_time: 0.40
+
+  # 动作耗时参数
+  action:
+    qr_scan_timeout: 3.0
+    image_scan_time: 1.2
+    drop_time: 1.0
+    hold_after_action: 0.25
+    # ACTION 软判稳：防止识别/投放动作被轻微抖动无限卡住。
+    action_soft_timeout: 1.50
+    action_soft_pos_eps: 0.18
+    action_soft_vel: 0.20
+
+    # 图片靶 / 特殊靶视觉闭环对准参数
+    # 视觉节点负责像素 -> 米制偏差；FSM 只使用 offset_x_m / offset_y_m 做小范围移动。
+    vision_result_timeout: 0.50
+    image_align_timeout: 4.0
+    special_align_timeout: 4.0
+    align_xy_eps: 0.05
+    align_step_max: 0.15
+    align_gain: 0.80
+    align_min_confidence: 0.75
+    align_min_stable_count: 3
+
+    # 圆环视觉搜索 / 穿越参数
+    # 视觉节点负责输出当前机体系下的 forward_m、offset_y_m、offset_z_m。
+    # FSM 在 RING_SEARCH_START 锁定圆环中心，动态生成 RING_PRE / RING_CENTER / RING_POST；
+    # 在 RING_PRE 再做一次左右/高度对准，然后连续穿过圆环。
+    ring_search_timeout: 5.0
+    ring_timeout_policy: hold   # hold：视觉失败原地等；fixed：失败后用 YAML 固定点继续；skip：失败后直接继续下个点
+    ring_pre_distance: 0.65
+    ring_post_distance: 0.80
+    ring_align_timeout: 4.0
+    ring_yz_eps: 0.07
+    ring_align_step_max: 0.12
+    ring_align_gain: 0.75
+    ring_min_confidence: 0.70
+    ring_min_stable_count: 3
+    ring_forward_min: 0.30
+    ring_forward_max: 3.50
+    ring_min_z: 1.35
+    ring_max_z: 1.85
+
+  # 固定任务点
+  waypoints:
+    # 01 二维码扫描点：坐标系1中二维码为 (1.8, 0)
+    - name: QR_SCAN
+      kind: scan
+      control_mode: fusion
+      action: qr_scan
+      x: 1.80
+      y: 0.00
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.46
+      acc: 0.48
+      hold_time: 0.50
+
+   # 02 顺时针绕障：改回四点菱形绕障，减少密集小航点导致的频繁降速。
+    # OBS_ENTRY / OBS_EXIT 保留 position，用于进入和退出绕障区；
+    # OBS_DOWN / OBS_LEFT / OBS_UP 使用 fusion_route，连续通过，不在每个菱形顶点 BRAKE。
+    - name: OBS_ENTRY
+      kind: route
+      control_mode: position
+      action: none
+      x: 3.40
+      y: 0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.85
+      acc: 0.75
+
+    - name: OBS_DOWN
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 5.20
+      y: 0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.90
+      acc: 0.80
+
+    - name: OBS_LEFT
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 5.20
+      y: -0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.90
+      acc: 0.80
+
+    - name: OBS_UP
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.40
+      y: -0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.90
+      acc: 0.80
+
+    - name: OBS_EXIT
+      kind: route
+      control_mode: position
+      action: none
+      x: 3.40
+      y: 0.10
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.85
+      acc: 0.75
+
+    # 03 图片靶顺序：图片靶2 -> 图片靶1 -> 图片靶3 -> 图片靶4
+    # 每个靶：先高处到正上方，再垂直下降投放判断，再原地爬升，避免低空横移。
+    - name: IMG2_OVER
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 3.60
+      y: -1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.58
+      acc: 0.55
+      hold_time: 0.15
+
+    - name: IMG2_DROP
+      kind: scan
+      control_mode: fusion
+      action: image_scan_maybe_drop
+      x: 3.60
+      y: -1.60
+      z: 0.75
+      yaw_deg: 0.0
+      speed: 0.36
+      acc: 0.34
+      hold_time: 0.35
+
+    - name: IMG2_UP
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 3.60
+      y: -1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.50
+      acc: 0.48
+      hold_time: 0.10
+
+    - name: IMG1_OVER
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 1.80
+      y: -1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.58
+      acc: 0.55
+      hold_time: 0.15
+
+    - name: IMG1_DROP
+      kind: scan
+      control_mode: fusion
+      action: image_scan_maybe_drop
+      x: 1.80
+      y: -1.60
+      z: 0.75
+      yaw_deg: 0.0
+      speed: 0.36
+      acc: 0.34
+      hold_time: 0.35
+
+    - name: IMG1_UP
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 1.80
+      y: -1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.50
+      acc: 0.48
+      hold_time: 0.10
+
+    - name: IMG3_OVER
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 1.80
+      y: 1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.58
+      acc: 0.55
+      hold_time: 0.15
+
+    - name: IMG3_DROP
+      kind: scan
+      control_mode: fusion
+      action: image_scan_maybe_drop
+      x: 1.80
+      y: 1.60
+      z: 0.75
+      yaw_deg: 0.0
+      speed: 0.36
+      acc: 0.34
+      hold_time: 0.35
+
+    - name: IMG3_UP
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 1.80
+      y: 1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.50
+      acc: 0.48
+      hold_time: 0.10
+
+    - name: IMG4_OVER
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 3.60
+      y: 1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.58
+      acc: 0.55
+      hold_time: 0.15
+
+    - name: IMG4_DROP
+      kind: scan
+      control_mode: fusion
+      action: image_scan_maybe_drop
+      x: 3.60
+      y: 1.60
+      z: 0.75
+      yaw_deg: 0.0
+      speed: 0.36
+      acc: 0.34
+      hold_time: 0.35
+
+    - name: IMG4_UP
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 3.60
+      y: 1.60
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.50
+      acc: 0.48
+      hold_time: 0.10
+
+    # 04 特殊靶：中心 (6.0, 1.0)
+    - name: SPECIAL_OVER
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 6.00
+      y: 1.00
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.58
+      acc: 0.55
+      hold_time: 0.25
+
+    - name: SPECIAL_DROP
+      kind: scan
+      control_mode: fusion
+      action: special_drop
+      x: 6.00
+      y: 1.00
+      z: 0.75
+      yaw_deg: 0.0
+      speed: 0.36
+      acc: 0.34
+      hold_time: 0.35
+
+    - name: SPECIAL_UP
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 6.00
+      y: 1.00
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.50
+      acc: 0.48
+      hold_time: 0.10
+
+    # 05 圆环：默认点只作为视觉失败或单独调航线时的 fallback。
+    # 正常流程：RING_SEARCH_START 停稳识别圆环 -> 动态生成 RING_PRE / RING_CENTER / RING_POST；
+    # RING_PRE 再做一次左右/高度对准 -> RING_CENTER 和 RING_POST 连续通过。
+    - name: RING_SEARCH_START
+      kind: scan
+      control_mode: fusion
+      action: ring_search
+      x: 4.80
+      y: -1.60
+      z: 1.60
+      yaw_deg: 0.0
+      speed: 0.45
+      acc: 0.42
+      hold_time: 0.30
+
+      - name: TURN
+      kind: scan
+      control_mode: fusion
+      action: ring_search
+      x: 4.80
+      y: -1.60
+      z: 1.60
+      yaw_deg: -90.0
+      speed: 0.45
+      acc: 0.42
+      hold_time: 0.30
+
+      - name: RING_SEARCH_START
+      kind: scan
+      control_mode: fusion
+      action: ring_search
+      x: 4.80
+      y: -1.60
+      z: 1.60
+      yaw_deg: -90.0
+      speed: 0.45
+      acc: 0.42
+      hold_time: 0.30
+
+    - name: RING_PRE
+      kind: scan
+      control_mode: fusion
+      action: ring_pre_align
+      x: 5.20
+      y: -1.60
+      z: 1.60
+      yaw_deg: -90.0
+      speed: 0.40
+      acc: 0.38
+      hold_time: 0.20
+
+    - name: RING_CENTER
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 6.00
+      y: -1.60
+      z: 1.60
+      yaw_deg: -90.0
+      speed: 0.50
+      acc: 0.45
+
+    
+
+    # 06 回降落区：先走上侧安全通道，再在 x=1.0 处切到目标降落点 y，避免斜穿障碍物附近。
+    - name: LAND_TOP_CORRIDOR
+      kind: route
+      control_mode: position
+      action: none
+      x: 6.00
+      y: -2.20
+      z: 1.35
+      yaw_deg: -90.0
+      speed: 0.80
+      acc: 0.70
+
+    - name: LAND_RIGHT_CORRIDOR
+      kind: route
+      control_mode: position
+      action: none
+      x: 1.00
+      y: -2.20
+      z: 1.35
+      yaw_deg: -90.0
+      speed: 0.95
+      acc: 0.80
+
+    - name: LAND_APPROACH_DYNAMIC
+      kind: route
+      control_mode: position
+      action: none
+      dynamic_land: true
+      x: 1.00
+      y: 0.00
+      z: 1.35
+      yaw_deg: -90.0
+      speed: 0.75
+      acc: 0.70
+
+    - name: LAND_FINAL_DYNAMIC
+      kind: scan
+      control_mode: fusion
+      action: mission_done
+      dynamic_land: true
+      x: 0.00
+      y: 0.00
+      z: 1.35
+      yaw_deg: -90.0
+      speed: 0.38
+      acc: 0.35
+      hold_time: 1.00
