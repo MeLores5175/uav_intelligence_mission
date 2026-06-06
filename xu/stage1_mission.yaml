@@ -33,7 +33,7 @@ mission:
   # 绕障圈数配置：只改 loop_count 即可控制绕几圈。
   # 实飞第一次建议 1；确认稳定后可改 2。
   obstacle:
-    loop_count: 1
+    loop_count: 2
     max_loop_count: 8
 
   # 降落点映射
@@ -439,7 +439,7 @@ mission:
       control_mode: fusion_route
       action: none
       x: 6.00
-      y: -2.35
+      y: -2.00
       z: 1.60
       yaw_deg: -90.0
       speed: 0.95
@@ -450,7 +450,7 @@ mission:
       control_mode: position
       action: none
       x: 6.00
-      y: -2.20
+      y: -1.60
       z: 1.35
       yaw_deg: -90.0
       speed: 0.80
@@ -461,7 +461,7 @@ mission:
       control_mode: position
       action: none
       x: 1.00
-      y: -2.20
+      y: -1.60
       z: 1.35
       yaw_deg: -90.0
       speed: 0.95
