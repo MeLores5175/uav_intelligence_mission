@@ -150,7 +150,7 @@ mission:
       acc: 0.48
       hold_time: 0.50
 
-    # 02 顺时针绕障：改回四点菱形绕障，减少密集小航点导致的频繁降速。
+   # 02 顺时针绕障：改回四点菱形绕障，减少密集小航点导致的频繁降速。
     # OBS_ENTRY / OBS_EXIT 保留 position，用于进入和退出绕障区；
     # OBS_DOWN / OBS_LEFT / OBS_UP 使用 fusion_route，连续通过，不在每个菱形顶点 BRAKE。
     - name: OBS_ENTRY
@@ -158,7 +158,7 @@ mission:
       control_mode: position
       action: none
       x: 3.40
-      y: 0.00
+      y: 0.90
       z: 1.35
       yaw_deg: 0.0
       speed: 0.85
@@ -168,7 +168,7 @@ mission:
       kind: route
       control_mode: fusion_route
       action: none
-      x: 4.30
+      x: 5.20
       y: 0.90
       z: 1.35
       yaw_deg: 0.0
@@ -180,7 +180,7 @@ mission:
       control_mode: fusion_route
       action: none
       x: 5.20
-      y: 0.00
+      y: -0.90
       z: 1.35
       yaw_deg: 0.0
       speed: 0.90
@@ -190,7 +190,7 @@ mission:
       kind: route
       control_mode: fusion_route
       action: none
-      x: 4.30
+      x: 3.40
       y: -0.90
       z: 1.35
       yaw_deg: 0.0
@@ -202,7 +202,7 @@ mission:
       control_mode: position
       action: none
       x: 3.40
-      y: 0.00
+      y: 0.10
       z: 1.35
       yaw_deg: 0.0
       speed: 0.85
