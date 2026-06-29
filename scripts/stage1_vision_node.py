@@ -163,9 +163,16 @@ class Stage1VisionNode:
             self.down_release_v = self.down_height * 0.5
 
         self.min_square_area_px = float(rospy.get_param("~min_square_area_px", 5000.0))
-        self.square_aspect_min = float(rospy.get_param("~square_aspect_min", 0.65))
-        self.square_aspect_max = float(rospy.get_param("~square_aspect_max", 1.45))
+        # 方形靶板几何过滤。默认按“接近正方形”的靶板收紧参数，减少背景矩形误检。
+        self.square_aspect_min = float(rospy.get_param("~square_aspect_min", 0.75))
+        self.square_aspect_max = float(rospy.get_param("~square_aspect_max", 1.30))
+        self.square_extent_min = float(rospy.get_param("~square_extent_min", 0.55))
+        self.square_angle_min_deg = float(rospy.get_param("~square_angle_min_deg", 55.0))
+        self.square_angle_max_deg = float(rospy.get_param("~square_angle_max_deg", 125.0))
         self.square_center_weight = float(rospy.get_param("~square_center_weight", 0.15))
+        # 特殊靶发布保护：避免第一帧误识别到背景方框就直接 detected=True。
+        self.special_min_stable_count = int(rospy.get_param("~special_min_stable_count", 3))
+        self.special_min_publish_confidence = float(rospy.get_param("~special_min_publish_confidence", 0.60))
         self.image_class_crop_ratio = float(rospy.get_param("~image_class_crop_ratio", 0.50))
         self.image_class_conf = float(rospy.get_param("~image_class_conf", IMAGE_CLASS_YOLO_CONF))
         self.min_result_confidence = float(rospy.get_param("~min_result_confidence", 0.20))
@@ -425,6 +432,34 @@ class Stage1VisionNode:
 
         return pts
 
+    def quad_corner_angles_deg(self, quad):
+        """
+        计算四边形四个角的角度。
+        作用：approxPolyDP 只能保证轮廓有 4 个点，不能保证它真的像矩形；
+        这里额外要求角度不要太离谱，用来过滤梯形、残缺边缘和不规则背景轮廓。
+        """
+        quad = np.array(quad, dtype=np.float32).reshape(4, 2)
+        angles = []
+
+        for i in range(4):
+            p_prev = quad[(i - 1) % 4]
+            p_curr = quad[i]
+            p_next = quad[(i + 1) % 4]
+
+            v1 = p_prev - p_curr
+            v2 = p_next - p_curr
+
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            if n1 <= 1e-6 or n2 <= 1e-6:
+                return []
+
+            cos_angle = float(np.dot(v1, v2) / (n1 * n2))
+            cos_angle = clamp(cos_angle, -1.0, 1.0)
+            angles.append(math.degrees(math.acos(cos_angle)))
+
+        return angles
+
     def find_square_board(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -478,8 +513,25 @@ class Stage1VisionNode:
             if min_side <= 1e-6:
                 continue
 
+            # 边长比例过滤：对正方形靶板更严格，减少普通矩形背景误检。
             aspect = max_side / min_side
             if aspect < self.square_aspect_min or aspect > self.square_aspect_max:
+                continue
+
+            # 轮廓饱满度过滤：避免细长边缘、破碎线框、支架边缘被四边形拟合后误认为靶板。
+            x, y, w, h = cv2.boundingRect(quad.astype(np.int32))
+            rect_area = float(w * h)
+            extent = area / rect_area if rect_area > 1e-6 else 0.0
+            if extent < self.square_extent_min:
+                continue
+
+            # 角度过滤：approxPolyDP 得到四个点后，再检查它是否真的像矩形。
+            angles = self.quad_corner_angles_deg(quad)
+            if len(angles) != 4:
+                continue
+            min_angle = min(angles)
+            max_angle = max(angles)
+            if min_angle < self.square_angle_min_deg or max_angle > self.square_angle_max_deg:
                 continue
 
             center = np.mean(quad, axis=0)
@@ -493,6 +545,9 @@ class Stage1VisionNode:
                     "center": center,
                     "area": area,
                     "aspect": aspect,
+                    "extent": float(extent),
+                    "min_angle_deg": float(min_angle),
+                    "max_angle_deg": float(max_angle),
                     "score": score
                 }
 
@@ -821,11 +876,21 @@ class Stage1VisionNode:
         # dedicated special-target detector is added later.
         area_score = clamp(square["area"] / (self.down_width * self.down_height * 0.25), 0.0, 1.0)
         aspect_score = clamp(1.0 - abs(1.0 - square["aspect"]), 0.0, 1.0)
-        confidence = clamp(0.35 + 0.35 * area_score + 0.30 * aspect_score, 0.0, 1.0)
+        extent_score = clamp((square.get("extent", 0.0) - self.square_extent_min) / 0.35, 0.0, 1.0)
+        confidence = clamp(
+            0.25 + 0.30 * area_score + 0.25 * aspect_score + 0.20 * extent_score,
+            0.0,
+            1.0
+        )
+        detected = (
+            stable_count >= self.special_min_stable_count and
+            confidence >= self.special_min_publish_confidence
+        )
 
         self.publish_result({
             "target": "special_target",
-            "detected": True,
+            "detected": bool(detected),
+            "reason": "ok" if detected else "unstable_or_low_confidence",
             "offset_x_m": float(offset_x_m),
             "offset_y_m": float(offset_y_m),
             "confidence": float(confidence),
@@ -835,17 +900,24 @@ class Stage1VisionNode:
             "offset_px": offset_px,
             "board_area_px": float(square["area"]),
             "board_aspect": float(square["aspect"]),
+            "board_extent": float(square.get("extent", 0.0)),
+            "board_min_angle_deg": float(square.get("min_angle_deg", 0.0)),
+            "board_max_angle_deg": float(square.get("max_angle_deg", 0.0)),
             "mapping_method": "square_homography_800mm",
             "detector_method": "opencv_square"
         })
 
         rospy.loginfo_throttle(
             0.3,
-            "[SPECIAL] conf=%.2f offset=(%.3f, %.3f) stable=%d",
+            "[SPECIAL] detected=%s conf=%.2f offset=(%.3f, %.3f) stable=%d extent=%.2f angle=(%.1f, %.1f)",
+            str(bool(detected)),
             confidence,
             offset_x_m,
             offset_y_m,
-            stable_count
+            stable_count,
+            float(square.get("extent", 0.0)),
+            float(square.get("min_angle_deg", 0.0)),
+            float(square.get("max_angle_deg", 0.0))
         )
 
         if self.show_debug:
