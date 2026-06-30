@@ -30,6 +30,15 @@ mission:
   wait_real_image: true
   wait_real_ring: true
 
+  # 二维码识别失败/仿真占位时使用的默认结果。
+  # class_1/class_2 必须和视觉节点输出的 class_name 完全一致。
+  # 这里先沿用对接文档示例 man,apple；实飞前请改成你们默认想投的两个类别。
+  qr_default:
+    enabled: true
+    class_1: man
+    class_2: apple
+    landing_side: right
+
   # 绕障圈数配置：只改 loop_count 即可控制绕几圈。
   # 实飞第一次建议 1；确认稳定后可改 2。
   obstacle:
@@ -111,14 +120,21 @@ mission:
   # 动作耗时参数
   action:
     qr_scan_timeout: 5.00
+    # 识别到图片类别但不是目标类别时，最少确认这么久后跳过该靶。
     image_scan_time: 0.45
+
     # 图片靶真实视觉两阶段：先在 1.35m 分类，匹配二维码才下降到 image_drop_z 对准投放。
+    # image_class_timeout 是高空等待类别的最大时间；保留 image_class_scan_time 作为旧参数兼容别名。
+    image_class_timeout: 0.80
     image_class_scan_time: 0.80
     image_class_min_confidence: 0.55
     image_class_min_stable_count: 1
     image_drop_z: 0.70
     image_descend_timeout: 2.50
     image_descend_pos_eps: 0.12
+    # 低空对准超时后，force_drop 表示已确认类别且已下降时直接投一次，尽量拿分；skip 表示跳过。
+    image_align_timeout_policy: force_drop
+
     drop_time: 1.0
     hold_after_action: 0.25
     # ACTION 软判稳：防止识别/投放动作被轻微抖动无限卡住。
