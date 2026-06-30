@@ -2,25 +2,54 @@
 # -*- coding: utf-8 -*-
 
 """
-UDP UAV Command Receiver
+UDP UAV Command Receiver + ESP32 Drop Serial Bridge
 
 作用：
 1. 在无人机端监听 UDP 指令；
 2. 将电脑端发送的简单字符串协议转换成 FSM 的 ROS 控制话题；
-3. 给电脑端返回 ACK / STATUS，方便后续写简易地面站脚本。
+3. 集成 ESP32 串口投放功能：
+   - 地面站手动发送 CMD:L1/L2/L3/R1/R2/R3 时，直接通过串口发给 ESP32；
+   - 地面站若发送 CMD:L0/R0，本节点也可拆成 L1~L3 / R1~R3 依次发给 ESP32；
+   - 订阅 /uav/drop_cmd，将 FSM 的 image_drop_1 / special_drop / image_drop_2 映射成 R1 / R3 / R2；
+4. 给电脑端返回 ACK / STATUS，方便简易地面站脚本使用。
 
 默认监听：
     192.168.151.102:8888
 
-如果后面想监听所有网卡，可以把 bind_ip 改成 0.0.0.0，
-或者运行时传参：
-    _bind_ip:=0.0.0.0
+默认 ESP32 串口：
+    /dev/ttyUSB0 @ 115200
+
+运行示例：
+    rosrun <your_pkg> udp_uav_cmd_receiver_integrated.py \
+        _bind_ip:=192.168.151.102 \
+        _bind_port:=8888 \
+        _esp32_port:=/dev/ttyUSB0 \
+        _esp32_baud:=115200
+
+地面站协议：
+    输入 start -> 发送 CMD:START -> 本节点发布 /uav/start=True
+    输入 L1    -> 发送 CMD:L1    -> 本节点串口发送 L1\n 给 ESP32
+    输入 R0    -> 地面站通常拆成 CMD:R1/CMD:R2/CMD:R3；若没拆，本节点也会拆。
+
+FSM 投放协议：
+    FSM 发布 /uav/drop_cmd = image_drop_1 -> 本节点串口发送 R1\n
+    FSM 发布 /uav/drop_cmd = special_drop  -> 本节点串口发送 R3\n
+    FSM 发布 /uav/drop_cmd = image_drop_2 -> 本节点串口发送 R2\n
 """
 
 import socket
-import rospy
+import time
+import threading
 
+import rospy
 from std_msgs.msg import Bool, String
+
+try:
+    import serial
+    HAS_SERIAL = True
+except Exception:
+    serial = None
+    HAS_SERIAL = False
 
 try:
     from mavros_msgs.msg import State
@@ -33,7 +62,7 @@ class UdpUavCmdReceiver:
     def __init__(self):
         rospy.init_node("udp_uav_cmd_receiver", anonymous=False)
 
-        # 你说先写成 192.168.151.102，后面可以自己改
+        # ---------- UDP 参数 ----------
         self.bind_ip = rospy.get_param("~bind_ip", "192.168.151.102")
         self.bind_port = int(rospy.get_param("~bind_port", 8888))
 
@@ -42,14 +71,48 @@ class UdpUavCmdReceiver:
         self.auth_token = str(rospy.get_param("~auth_token", "")).strip()
         self.fsm_heartbeat_timeout = float(rospy.get_param("~fsm_heartbeat_timeout", 2.0))
 
-        # FSM 控制话题
+        # ---------- ESP32 串口投放参数 ----------
+        self.drop_serial_enabled = bool(rospy.get_param("~drop_serial_enabled", True))
+        self.esp32_port = str(rospy.get_param("~esp32_port", "/dev/ttyUSB0"))
+        self.esp32_baud = int(rospy.get_param("~esp32_baud", 115200))
+        self.serial_timeout = float(rospy.get_param("~serial_timeout", 0.5))
+        self.serial_read_wait = float(rospy.get_param("~serial_read_wait", 0.25))
+        self.drop_step_delay = float(rospy.get_param("~drop_step_delay", 0.35))
+        self.esp32_boot_wait = float(rospy.get_param("~esp32_boot_wait", 2.0))
+        self.serial_reopen_interval = float(rospy.get_param("~serial_reopen_interval", 2.0))
+
+        self.esp32_ser = None
+        self.serial_lock = threading.Lock()
+        self.last_serial_open_try = 0.0
+        self.last_serial_error = "NONE"
+        self.last_serial_cmd = "NONE"
+        self.last_serial_time = None
+        self.last_drop_cmd = "NONE"
+        self.last_drop_result = "NONE"
+
+        # FSM drop_cmd -> ESP32 串口指令映射。
+        # 用户指定三个靶子顺序：1、3、2，即 image_drop_1 -> R1，special_drop -> R3，image_drop_2 -> R2。
+        self.drop_cmd_map = {
+            "IMAGE_DROP_1": "R1",
+            "SPECIAL_DROP": "R3",
+            "IMAGE_DROP_2": "R2",
+            # 兼容直接发布 ESP32 指令。
+            "R1": "R1",
+            "R2": "R2",
+            "R3": "R3",
+            "L1": "L1",
+            "L2": "L2",
+            "L3": "L3",
+        }
+
+        # ---------- FSM 控制话题 ----------
         self.start_pub = rospy.Publisher("/uav/start", Bool, queue_size=10)
         self.land_pub = rospy.Publisher("/uav/land", Bool, queue_size=10)
         self.stop_pub = rospy.Publisher("/uav/stop", Bool, queue_size=10)
         self.reset_pub = rospy.Publisher("/uav/reset", Bool, queue_size=10)
         self.disarm_pub = rospy.Publisher("/uav/disarm", Bool, queue_size=10)
 
-        # 读取 FSM 状态，便于电脑端 STATUS 查询
+        # ---------- 读取 FSM 状态，便于电脑端 STATUS 查询 ----------
         self.fsm_state = "UNKNOWN"
         self.safety_state = "UNKNOWN"
         self.land_status = "UNKNOWN"
@@ -59,7 +122,10 @@ class UdpUavCmdReceiver:
         rospy.Subscriber("/uav/safety_state", String, self.safety_state_cb, queue_size=10)
         rospy.Subscriber("/uav/land_status", String, self.land_status_cb, queue_size=10)
 
-        # 可选读取 MAVROS 状态
+        # FSM 自动投放命令入口。
+        rospy.Subscriber("/uav/drop_cmd", String, self.drop_cmd_cb, queue_size=10)
+
+        # ---------- 可选读取 MAVROS 状态 ----------
         self.mavros_connected = "UNKNOWN"
         self.mavros_armed = "UNKNOWN"
         self.mavros_mode = "UNKNOWN"
@@ -67,11 +133,17 @@ class UdpUavCmdReceiver:
         if HAS_MAVROS_MSG:
             rospy.Subscriber("/mavros/state", State, self.mavros_state_cb, queue_size=10)
 
-        # UDP socket
+        # ---------- UDP socket ----------
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.bind_ip, self.bind_port))
         self.sock.settimeout(0.1)
+
+        # 尝试打开 ESP32 串口。
+        if self.drop_serial_enabled:
+            self.open_esp32_serial(force=True)
+        else:
+            self.last_serial_error = "SERIAL_DISABLED"
 
         rospy.logwarn(
             "UDP UAV command receiver started. Listening on %s:%d",
@@ -80,8 +152,20 @@ class UdpUavCmdReceiver:
         )
 
         rospy.logwarn(
-            "Supported commands: CMD:PING, CMD:STATUS, CMD:START, CMD:LAND, CMD:STOP, CMD:RESET, CMD:DISARM"
+            "Supported commands: CMD:PING, CMD:STATUS, CMD:START, CMD:LAND, CMD:STOP, CMD:RESET, CMD:DISARM, "
+            "CMD:L1/L2/L3, CMD:R1/R2/R3, CMD:L0/R0"
         )
+
+        rospy.logwarn(
+            "Drop mapping: image_drop_1->R1, special_drop->R3, image_drop_2->R2. ESP32 serial=%s @ %d enabled=%s",
+            self.esp32_port,
+            self.esp32_baud,
+            str(self.drop_serial_enabled)
+        )
+
+    # =========================
+    # ROS 状态回调
+    # =========================
 
     def fsm_state_cb(self, msg):
         self.fsm_state = msg.data
@@ -97,6 +181,37 @@ class UdpUavCmdReceiver:
         self.mavros_connected = str(msg.connected)
         self.mavros_armed = str(msg.armed)
         self.mavros_mode = msg.mode
+
+    def drop_cmd_cb(self, msg):
+        """
+        FSM 自动投放入口。
+        FSM 满足图片靶/特殊靶视觉条件后发布 /uav/drop_cmd，
+        本节点负责映射并通过串口发送给 ESP32。
+        """
+        raw_cmd = msg.data.strip()
+        if raw_cmd == "":
+            rospy.logwarn("/uav/drop_cmd empty, ignored.")
+            return
+
+        serial_cmd = self.map_drop_cmd_to_serial(raw_cmd)
+        self.last_drop_cmd = raw_cmd
+
+        if serial_cmd is None:
+            self.last_drop_result = "UNMAPPED"
+            rospy.logerr("/uav/drop_cmd unmapped: %s", raw_cmd)
+            return
+
+        ok, reason = self.send_serial_cmd(serial_cmd)
+        self.last_drop_result = "%s:%s" % (serial_cmd, reason)
+
+        if ok:
+            rospy.logwarn("FSM drop_cmd %s -> ESP32 %s OK", raw_cmd, serial_cmd)
+        else:
+            rospy.logerr("FSM drop_cmd %s -> ESP32 %s FAILED: %s", raw_cmd, serial_cmd, reason)
+
+    # =========================
+    # UDP / ROS 工具
+    # =========================
 
     def send_reply(self, text, addr):
         try:
@@ -122,6 +237,8 @@ class UdpUavCmdReceiver:
         支持格式：
             CMD:START
             CMD:START:token
+            CMD:L1
+            CMD:R0
 
         返回：
             command, error
@@ -150,7 +267,7 @@ class UdpUavCmdReceiver:
             if token != self.auth_token:
                 return None, "AUTH_FAILED"
 
-        # 兼容一些别名，电脑端写起来更自由
+        # 兼容一些别名，电脑端写起来更自由。
         alias = {
             "TAKEOFF": "START",
             "BEGIN": "START",
@@ -164,6 +281,205 @@ class UdpUavCmdReceiver:
         cmd = alias.get(cmd, cmd)
         return cmd, None
 
+    # =========================
+    # ESP32 串口桥接
+    # =========================
+
+    def open_esp32_serial(self, force=False):
+        """尝试打开 ESP32 串口。失败时不让整个 UDP 节点崩溃。"""
+        if not self.drop_serial_enabled:
+            self.last_serial_error = "SERIAL_DISABLED"
+            return False
+
+        if not HAS_SERIAL:
+            self.last_serial_error = "PY_SERIAL_NOT_INSTALLED"
+            rospy.logerr("pyserial is not installed. Install with: sudo apt install python3-serial")
+            return False
+
+        now = time.time()
+        if not force and now - self.last_serial_open_try < self.serial_reopen_interval:
+            return self.esp32_ser is not None and getattr(self.esp32_ser, "is_open", False)
+
+        self.last_serial_open_try = now
+
+        with self.serial_lock:
+            try:
+                if self.esp32_ser is not None and self.esp32_ser.is_open:
+                    return True
+            except Exception:
+                pass
+
+            try:
+                rospy.logwarn("Opening ESP32 serial: %s @ %d", self.esp32_port, self.esp32_baud)
+                self.esp32_ser = serial.Serial(
+                    port=self.esp32_port,
+                    baudrate=self.esp32_baud,
+                    timeout=self.serial_timeout,
+                    write_timeout=self.serial_timeout
+                )
+
+                if self.esp32_boot_wait > 0:
+                    rospy.sleep(self.esp32_boot_wait)
+
+                self.esp32_ser.reset_input_buffer()
+                self.esp32_ser.reset_output_buffer()
+
+                self.last_serial_error = "OK"
+                rospy.logwarn("ESP32 serial opened: %s", self.esp32_port)
+                return True
+
+            except Exception as e:
+                self.esp32_ser = None
+                self.last_serial_error = str(e)
+                rospy.logerr("Open ESP32 serial failed: %s", str(e))
+                return False
+
+    def ensure_serial_ready(self):
+        """确保串口可用；不可用时尝试按间隔重连。"""
+        try:
+            if self.esp32_ser is not None and self.esp32_ser.is_open:
+                return True
+        except Exception:
+            self.esp32_ser = None
+
+        return self.open_esp32_serial(force=False)
+
+    def read_esp32_lines(self, wait_time=None):
+        """尝试读取 ESP32 串口回传。没有回传也不认为失败。"""
+        if wait_time is None:
+            wait_time = self.serial_read_wait
+
+        lines = []
+        if self.esp32_ser is None:
+            return lines
+
+        end_time = time.time() + wait_time
+
+        while time.time() < end_time and not rospy.is_shutdown():
+            try:
+                line = self.esp32_ser.readline()
+            except Exception:
+                break
+
+            if not line:
+                continue
+
+            text = line.decode("utf-8", errors="ignore").strip()
+            if text:
+                lines.append(text)
+
+        return lines
+
+    def send_serial_cmd(self, cmd):
+        """给 ESP32 发送一条串口命令，例如 R1、L2。"""
+        cmd = cmd.strip().upper()
+
+        if not cmd:
+            return False, "EMPTY"
+
+        if not self.is_single_drop_cmd(cmd):
+            return False, "BAD_SERIAL_CMD"
+
+        if not self.ensure_serial_ready():
+            return False, "SERIAL_NOT_READY:%s" % self.last_serial_error
+
+        data = (cmd + "\n").encode("utf-8")
+
+        with self.serial_lock:
+            try:
+                self.esp32_ser.write(data)
+                self.esp32_ser.flush()
+            except Exception as e:
+                self.last_serial_error = str(e)
+                try:
+                    if self.esp32_ser is not None:
+                        self.esp32_ser.close()
+                except Exception:
+                    pass
+                self.esp32_ser = None
+                return False, "SERIAL_WRITE_ERR:%s" % str(e)
+
+            esp_lines = self.read_esp32_lines()
+
+        self.last_serial_cmd = cmd
+        self.last_serial_time = rospy.Time.now()
+        self.last_serial_error = "OK"
+
+        if esp_lines:
+            rospy.logwarn("ESP32 reply for %s: %s", cmd, " | ".join(esp_lines))
+
+        return True, "SERIAL_OK"
+
+    def is_single_drop_cmd(self, cmd):
+        """单个舵机指令：L1/L2/L3/R1/R2/R3。"""
+        if len(cmd) != 2:
+            return False
+        if cmd[0] not in ["L", "R"]:
+            return False
+        if cmd[1] not in ["1", "2", "3"]:
+            return False
+        return True
+
+    def is_all_drop_cmd(self, cmd):
+        """全部动作指令：L0/R0。"""
+        return cmd in ["L0", "R0"]
+
+    def handle_l0_r0(self, cmd):
+        """
+        L0/R0 不作为单条串口命令给 ESP32，而是拆成三条：
+            L0 -> L1 L2 L3
+            R0 -> R1 R2 R3
+        """
+        prefix = cmd[0]
+        sent_list = []
+
+        for i in range(1, 4):
+            sub_cmd = "%s%d" % (prefix, i)
+            ok, reason = self.send_serial_cmd(sub_cmd)
+            sent_list.append("%s:%s" % (sub_cmd, reason))
+
+            if not ok:
+                return False, ";".join(sent_list)
+
+            rospy.sleep(self.drop_step_delay)
+
+        return True, ";".join(sent_list)
+
+    def map_drop_cmd_to_serial(self, drop_cmd):
+        """把 FSM 的 /uav/drop_cmd 映射成 ESP32 串口指令。"""
+        key = drop_cmd.strip().upper()
+        return self.drop_cmd_map.get(key, None)
+
+    # =========================
+    # STATUS / PING
+    # =========================
+
+    def serial_status_text(self):
+        if not self.drop_serial_enabled:
+            state = "DISABLED"
+        elif self.esp32_ser is not None and getattr(self.esp32_ser, "is_open", False):
+            state = "OK"
+        else:
+            state = "NOT_READY"
+
+        return (
+            "drop_serial=%s;"
+            "esp32_port=%s;"
+            "esp32_baud=%d;"
+            "last_serial_cmd=%s;"
+            "last_serial_error=%s;"
+            "last_drop_cmd=%s;"
+            "last_drop_result=%s"
+        ) % (
+            state,
+            self.esp32_port,
+            self.esp32_baud,
+            self.last_serial_cmd,
+            self.last_serial_error,
+            self.last_drop_cmd,
+            self.last_drop_result
+        )
+
     def build_status_text(self):
         return (
             "STATUS:"
@@ -172,29 +488,33 @@ class UdpUavCmdReceiver:
             "land=%s;"
             "connected=%s;"
             "armed=%s;"
-            "mode=%s"
+            "mode=%s;"
+            "%s"
         ) % (
             self.fsm_state,
             self.safety_state,
             self.land_status,
             self.mavros_connected,
             self.mavros_armed,
-            self.mavros_mode
+            self.mavros_mode,
+            self.serial_status_text()
         )
 
     def build_ping_text(self):
         """
-        PING 同时检查 UDP 接收节点和 FSM 心跳。
-        只要本函数能回复，说明 UDP 接收节点在线；最近收到 /uav/fsm_state 则认为 FSM 正常。
+        PING 同时检查 UDP 接收节点、FSM 心跳和投放串口状态。
         """
+        serial_part = self.serial_status_text()
+
         if self.fsm_state_last_time is None:
             return (
                 "ACK:PING:RECEIVER_OK;"
                 "receiver=OK;"
                 "fsm=NO_HEARTBEAT;"
                 "fsm_age=NA;"
-                "state=%s"
-            ) % self.fsm_state
+                "state=%s;"
+                "%s"
+            ) % (self.fsm_state, serial_part)
 
         age = (rospy.Time.now() - self.fsm_state_last_time).to_sec()
 
@@ -204,16 +524,22 @@ class UdpUavCmdReceiver:
                 "receiver=OK;"
                 "fsm=NORMAL;"
                 "fsm_age=%.2f;"
-                "state=%s"
-            ) % (age, self.fsm_state)
+                "state=%s;"
+                "%s"
+            ) % (age, self.fsm_state, serial_part)
 
         return (
             "ACK:PING:RECEIVER_OK;"
             "receiver=OK;"
             "fsm=TIMEOUT;"
             "fsm_age=%.2f;"
-            "state=%s"
-        ) % (age, self.fsm_state)
+            "state=%s;"
+            "%s"
+        ) % (age, self.fsm_state, serial_part)
+
+    # =========================
+    # UDP 命令处理
+    # =========================
 
     def handle_command(self, raw_text, addr):
         cmd, error = self.parse_command(raw_text)
@@ -232,6 +558,24 @@ class UdpUavCmdReceiver:
 
         if cmd == "STATUS":
             self.send_reply(self.build_status_text(), addr)
+            return
+
+        # 地面站手动投放机构控制：直接转 ESP32 串口。
+        if self.is_single_drop_cmd(cmd):
+            ok, reason = self.send_serial_cmd(cmd)
+            if ok:
+                self.send_reply("ACK:%s:%s" % (cmd, reason), addr)
+            else:
+                self.send_reply("ERR:%s:%s" % (cmd, reason), addr)
+            return
+
+        # 兼容直接发送 L0/R0。地面站通常已经拆分，本节点再做一次兜底。
+        if self.is_all_drop_cmd(cmd):
+            ok, reason = self.handle_l0_r0(cmd)
+            if ok:
+                self.send_reply("ACK:%s:%s" % (cmd, reason), addr)
+            else:
+                self.send_reply("ERR:%s:%s" % (cmd, reason), addr)
             return
 
         if cmd == "START":
@@ -285,6 +629,20 @@ class UdpUavCmdReceiver:
                 self.handle_command(text, addr)
 
             rate.sleep()
+
+        self.close()
+
+    def close(self):
+        try:
+            if self.esp32_ser is not None:
+                self.esp32_ser.close()
+        except Exception:
+            pass
+
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
