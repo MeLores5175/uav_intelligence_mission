@@ -10,7 +10,7 @@ UDP UAV Command Receiver + ESP32 Drop Serial Bridge
 3. 集成 ESP32 串口投放功能：
    - 地面站手动发送 CMD:L1/L2/L3/R1/R2/R3 时，直接通过串口发给 ESP32；
    - 地面站若发送 CMD:L0/R0，本节点也可拆成 L1~L3 / R1~R3 依次发给 ESP32；
-   - 订阅 /uav/drop_cmd，将 FSM 的 image_drop_1 / special_drop / image_drop_2 映射成 R1 / R3 / R2；
+   - 订阅 /uav/drop_cmd，将 FSM 的 image_drop_1 / special_drop / image_drop_2 映射成 R1 / R2 / R3；
 4. 给电脑端返回 ACK / STATUS，方便简易地面站脚本使用。
 
 默认监听：
@@ -33,8 +33,8 @@ UDP UAV Command Receiver + ESP32 Drop Serial Bridge
 
 FSM 投放协议：
     FSM 发布 /uav/drop_cmd = image_drop_1 -> 本节点串口发送 R1\n
-    FSM 发布 /uav/drop_cmd = special_drop  -> 本节点串口发送 R3\n
-    FSM 发布 /uav/drop_cmd = image_drop_2 -> 本节点串口发送 R2\n
+    FSM 发布 /uav/drop_cmd = special_drop  -> 本节点串口发送 R2\n
+    FSM 发布 /uav/drop_cmd = image_drop_2 -> 本节点串口发送 R3\n
 """
 
 import socket
@@ -91,11 +91,11 @@ class UdpUavCmdReceiver:
         self.last_drop_result = "NONE"
 
         # FSM drop_cmd -> ESP32 串口指令映射。
-        # 用户指定三个靶子顺序：1、3、2，即 image_drop_1 -> R1，special_drop -> R3，image_drop_2 -> R2。
+        # 用户指定三个靶子顺序：1、3、2，即 image_drop_1 -> R1，special_drop -> R2，image_drop_2 -> R3。
         self.drop_cmd_map = {
             "IMAGE_DROP_1": "R1",
-            "SPECIAL_DROP": "R3",
-            "IMAGE_DROP_2": "R2",
+            "SPECIAL_DROP": "R2",
+            "IMAGE_DROP_2": "R3",
             # 兼容直接发布 ESP32 指令。
             "R1": "R1",
             "R2": "R2",
