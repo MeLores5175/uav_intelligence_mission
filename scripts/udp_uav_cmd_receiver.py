@@ -40,6 +40,8 @@ FSM 投放协议：
 import socket
 import time
 import threading
+import os
+import glob
 
 import rospy
 from std_msgs.msg import Bool, String
@@ -76,14 +78,18 @@ class UdpUavCmdReceiver:
         self.esp32_port = str(rospy.get_param("~esp32_port", "/dev/ttyUSB0"))
         self.esp32_baud = int(rospy.get_param("~esp32_baud", 115200))
         self.serial_timeout = float(rospy.get_param("~serial_timeout", 0.5))
-        self.serial_read_wait = float(rospy.get_param("~serial_read_wait", 0.25))
+        self.serial_read_wait = float(rospy.get_param("~serial_read_wait", 1.0))
         self.drop_step_delay = float(rospy.get_param("~drop_step_delay", 0.35))
-        self.esp32_boot_wait = float(rospy.get_param("~esp32_boot_wait", 2.0))
+        self.esp32_boot_wait = float(rospy.get_param("~esp32_boot_wait", 3.0))
         self.serial_reopen_interval = float(rospy.get_param("~serial_reopen_interval", 2.0))
+        # 自动串口发现：如果 esp32_port 指向的 /dev/ttyUSB0 不存在，
+        # 自动尝试 /dev/serial/by-id/*、/dev/ttyUSB*、/dev/ttyACM*。
+        self.serial_auto_detect = bool(rospy.get_param("~serial_auto_detect", True))
+        self.serial_candidates = []
         # 串口命令可靠性参数：每条 L/R 命令最多发送 serial_retry_count 次。
         # 只有读到 ESP32 回传 OK 才认为成功；读到 ERR 或超时未回 OK 会重发。
         self.serial_retry_count = int(rospy.get_param("~serial_retry_count", 3))
-        self.serial_retry_delay = float(rospy.get_param("~serial_retry_delay", 0.12))
+        self.serial_retry_delay = float(rospy.get_param("~serial_retry_delay", 0.2))
 
         self.esp32_ser = None
         self.serial_lock = threading.Lock()
@@ -163,10 +169,15 @@ class UdpUavCmdReceiver:
         )
 
         rospy.logwarn(
-            "Drop mapping: image_drop_1->R1, image_drop_2->R3, special_drop->R2. ESP32 serial=%s @ %d enabled=%s",
+            "Drop mapping: image_drop_1->R1, image_drop_2->R3, special_drop->R2. "
+            "ESP32 serial=%s @ %d enabled=%s read_wait=%.2fs boot_wait=%.2fs retry=%d delay=%.2fs",
             self.esp32_port,
             self.esp32_baud,
-            str(self.drop_serial_enabled)
+            str(self.drop_serial_enabled),
+            self.serial_read_wait,
+            self.esp32_boot_wait,
+            self.serial_retry_count,
+            self.serial_retry_delay
         )
 
     # =========================
@@ -291,8 +302,99 @@ class UdpUavCmdReceiver:
     # ESP32 串口桥接
     # =========================
 
+    def list_serial_candidates(self):
+        """
+        枚举可能的 ESP32 串口。
+        优先顺序：
+        1. 当前配置的 esp32_port，如果存在；
+        2. /dev/serial/by-id/ 下的稳定设备名，优先 Espressif/CP210/CH340；
+        3. /dev/ttyUSB*；
+        4. /dev/ttyACM*。
+        """
+        candidates = []
+
+        def add(path):
+            if not path:
+                return
+            if path in candidates:
+                return
+            # /dev/serial/by-id 下是符号链接，exists 会跟随链接判断真实设备是否存在。
+            if os.path.exists(path):
+                candidates.append(path)
+
+        add(self.esp32_port)
+
+        by_id = sorted(glob.glob("/dev/serial/by-id/*"))
+        preferred_keywords = [
+            "ESPRESSIF",
+            "USB_JTAG",
+            "CP210",
+            "CH340",
+            "CH341",
+            "WCH",
+            "UART",
+            "SERIAL",
+        ]
+
+        preferred = []
+        normal = []
+        for path in by_id:
+            upper = os.path.basename(path).upper()
+            if any(k in upper for k in preferred_keywords):
+                preferred.append(path)
+            else:
+                normal.append(path)
+
+        for path in preferred + normal:
+            add(path)
+
+        for path in sorted(glob.glob("/dev/ttyUSB*")):
+            add(path)
+
+        for path in sorted(glob.glob("/dev/ttyACM*")):
+            add(path)
+
+        self.serial_candidates = candidates
+        return candidates
+
+    def build_serial_missing_reason(self):
+        """生成串口不存在时更容易看懂的错误信息。"""
+        candidates = self.list_serial_candidates()
+        if candidates:
+            return "configured=%s missing; candidates=%s" % (
+                self.esp32_port,
+                ",".join(candidates)
+            )
+        return "configured=%s missing; no /dev/serial/by-id, /dev/ttyUSB*, /dev/ttyACM* found" % self.esp32_port
+
+    def get_ports_to_try(self):
+        """
+        返回本次打开串口要尝试的端口列表。
+        如果开启自动发现，即使配置的 /dev/ttyUSB0 不存在，也会自动尝试当前实际存在的端口。
+        """
+        ports = []
+
+        def add_port(path):
+            if path and path not in ports:
+                ports.append(path)
+
+        if os.path.exists(self.esp32_port):
+            add_port(self.esp32_port)
+
+        if self.serial_auto_detect:
+            for path in self.list_serial_candidates():
+                add_port(path)
+        else:
+            add_port(self.esp32_port)
+
+        # 如果没有任何候选，也保留原配置，便于错误信息明确指出它不存在。
+        if not ports:
+            add_port(self.esp32_port)
+
+        return ports
+
     def open_esp32_serial(self, force=False):
-        """尝试打开 ESP32 串口。失败时不让整个 UDP 节点崩溃。"""
+        """尝试打开 ESP32 串口。失败时不让整个 UDP 节点崩溃；开启自动发现时会尝试当前存在的 USB/ACM 端口。"""
         if not self.drop_serial_enabled:
             self.last_serial_error = "SERIAL_DISABLED"
             return False
@@ -315,30 +417,50 @@ class UdpUavCmdReceiver:
             except Exception:
                 pass
 
-            try:
-                rospy.logwarn("Opening ESP32 serial: %s @ %d", self.esp32_port, self.esp32_baud)
-                self.esp32_ser = serial.Serial(
-                    port=self.esp32_port,
-                    baudrate=self.esp32_baud,
-                    timeout=self.serial_timeout,
-                    write_timeout=self.serial_timeout
-                )
+            ports_to_try = self.get_ports_to_try()
+            errors = []
 
-                if self.esp32_boot_wait > 0:
-                    rospy.sleep(self.esp32_boot_wait)
+            for port in ports_to_try:
+                try:
+                    rospy.logwarn("Opening ESP32 serial: %s @ %d", port, self.esp32_baud)
+                    self.esp32_ser = serial.Serial(
+                        port=port,
+                        baudrate=self.esp32_baud,
+                        timeout=self.serial_timeout,
+                        write_timeout=self.serial_timeout
+                    )
 
-                self.esp32_ser.reset_input_buffer()
-                self.esp32_ser.reset_output_buffer()
+                    # 尽量避免某些 USB 转串口板在打开串口时被 DTR/RTS 反复复位。
+                    try:
+                        self.esp32_ser.setDTR(False)
+                        self.esp32_ser.setRTS(False)
+                    except Exception:
+                        pass
 
-                self.last_serial_error = "OK"
-                rospy.logwarn("ESP32 serial opened: %s", self.esp32_port)
-                return True
+                    # 串口打开可能导致 ESP32 复位，等待一下再清缓冲。
+                    if self.esp32_boot_wait > 0:
+                        rospy.sleep(self.esp32_boot_wait)
 
-            except Exception as e:
-                self.esp32_ser = None
-                self.last_serial_error = str(e)
-                rospy.logerr("Open ESP32 serial failed: %s", str(e))
-                return False
+                    self.esp32_ser.reset_input_buffer()
+                    self.esp32_ser.reset_output_buffer()
+
+                    self.esp32_port = port
+                    self.last_serial_error = "OK"
+                    rospy.logwarn("ESP32 serial opened: %s", self.esp32_port)
+                    return True
+
+                except Exception as e:
+                    self.esp32_ser = None
+                    errors.append("%s:%s" % (port, str(e)))
+                    rospy.logwarn("Open ESP32 serial failed on %s: %s", port, str(e))
+
+            if errors:
+                self.last_serial_error = " | ".join(errors)
+            else:
+                self.last_serial_error = self.build_serial_missing_reason()
+
+            rospy.logerr("Open ESP32 serial failed: %s", self.last_serial_error)
+            return False
 
     def ensure_serial_ready(self):
         """确保串口可用；不可用时尝试按间隔重连。"""
@@ -541,6 +663,7 @@ class UdpUavCmdReceiver:
             "last_serial_error=%s;"
             "last_serial_attempts=%d;"
             "last_serial_reply=%s;"
+            "serial_candidates=%s;"
             "last_drop_cmd=%s;"
             "last_drop_result=%s"
         ) % (
@@ -551,6 +674,7 @@ class UdpUavCmdReceiver:
             self.last_serial_error,
             self.last_serial_attempts,
             self.last_serial_reply,
+            ",".join(self.serial_candidates) if self.serial_candidates else "NONE",
             self.last_drop_cmd,
             self.last_drop_result
         )

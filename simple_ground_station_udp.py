@@ -42,10 +42,93 @@ UAV_IP = "192.168.151.102"
 UAV_PORT = 8888
 BOOT_PORT = UAV_PORT
 
-RECV_TIMEOUT = 1.0
+RECV_TIMEOUT = 5.0
 
 # L0 / R0 拆分发送时，每个舵机指令之间的间隔
 DROP_STEP_DELAY = 0.35
+
+
+
+def drain_socket(sock):
+    """
+    清空 UDP socket 中可能残留的上一条迟到回包。
+    解决 L2 收到 L1 回包这种错位问题。
+    """
+    old_timeout = sock.gettimeout()
+
+    try:
+        sock.settimeout(0.0)
+
+        while True:
+            try:
+                sock.recvfrom(4096)
+            except BlockingIOError:
+                break
+            except socket.timeout:
+                break
+            except Exception:
+                break
+    finally:
+        sock.settimeout(old_timeout)
+
+
+def reply_matches(msg, reply):
+    """
+    判断当前回包是否属于本次发送的命令。
+    如果不匹配，就认为是上一条命令的迟到回包，继续等待。
+    """
+    msg = msg.strip().upper()
+    reply = reply.strip().upper()
+
+    if not msg.startswith("CMD:"):
+        return True
+
+    cmd = msg[4:].strip()
+
+    if cmd == "PING":
+        return reply.startswith("ACK:PING")
+
+    if cmd == "STATUS":
+        return reply.startswith("STATUS:")
+
+    # BOOT 回包一般是 ACK:BOOT:STARTING
+    if cmd == "BOOT":
+        return reply.startswith("ACK:BOOT") or reply.startswith("ERR:BOOT")
+
+    # 普通命令期望 ACK:<CMD>:... 或 ERR:<CMD>:...
+    return (
+        reply.startswith("ACK:%s" % cmd) or
+        reply.startswith("ERR:%s" % cmd) or
+        reply.startswith("ERR:UNKNOWN_CMD:%s" % msg)
+    )
+
+
+def wait_reply(sock, msg):
+    """
+    等待本次命令对应的回包。
+    若收到迟到回包，会打印并丢弃，直到收到匹配回包或总超时。
+    """
+    deadline = time.time() + RECV_TIMEOUT
+
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise socket.timeout()
+
+        old_timeout = sock.gettimeout()
+        sock.settimeout(remaining)
+
+        try:
+            data, from_addr = sock.recvfrom(4096)
+        finally:
+            sock.settimeout(old_timeout)
+
+        reply = data.decode("utf-8", errors="ignore").strip()
+
+        if reply_matches(msg, reply):
+            return reply, from_addr
+
+        print("收到迟到/错位回传，已丢弃：", reply)
 
 
 def print_ping_result(reply):
@@ -80,6 +163,9 @@ def send_cmd(sock, cmd, port=None):
     if not cmd:
         return
 
+    # 发送新命令前先清空上一条迟到回包，避免 UDP 回包错位。
+    drain_socket(sock)
+
     # 允许用户直接输入 START / L1 / R1
     # 也允许输入 CMD:START / CMD:L1 / CMD:R1
     if not cmd.startswith("CMD:"):
@@ -101,8 +187,7 @@ def send_cmd(sock, cmd, port=None):
         return
 
     try:
-        data, from_addr = sock.recvfrom(2048)
-        reply = data.decode("utf-8", errors="ignore").strip()
+        reply, from_addr = wait_reply(sock, msg)
         print("收到回传：", reply)
         print("来自：", from_addr[0], from_addr[1])
 
@@ -148,6 +233,7 @@ def send_drop_sequence(sock, prefix):
 def print_help():
     print("\n========== 简易 UDP 地面站 ==========")
     print("无人机地址：{}:{}".format(UAV_IP, UAV_PORT))
+    print("回包超时：{} 秒，自动丢弃上一条迟到回包".format(RECV_TIMEOUT))
     print("BOOT 地址：{}:{}".format(UAV_IP, BOOT_PORT))
     print("")
     print("基础命令：")
